@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import plotly.express as px
 from io import BytesIO
 
 # ================= 全局字体配置（解决云端中文乱码方框） =================
@@ -907,14 +908,36 @@ elif page == "💰 成本经济核算":
             Q_month = bp['Q_actual'] * 30
             unit_cost = total_month / Q_month
 
-            # 饼图
-            fig, ax = plt.subplots(figsize=(6, 5))
+            # 构造Plotly绘图数据集
             labels = ["电费", "药剂费", "污泥处置", "人员工资", "维修耗材", "其他"]
             values = [power_cost, med_cost, sludge_cost, staff_cost, maintain_cost, other_cost]
-            colors = ["#36a2eb", "#4bc0c0", "#ff9f40", "#ff6384", "#9966ff", "#c9cbcf"]
-            ax.pie(values, labels=labels, autopct="%1.1f%%", colors=colors, startangle=90,
-                   wedgeprops=dict(width=0.4, edgecolor="white"))
-            ax.set_title("月度运行成本构成占比", fontsize=12)
+            cost_df_plot = pd.DataFrame({
+                "成本类别": labels,
+                "月度费用": values
+            })
+
+            # 绘制环形空心饼图
+            fig = px.pie(
+                cost_df_plot,
+                values="月度费用",
+                names="成本类别",
+                hole=0.4,  # 空心环形
+                color_discrete_sequence=["#36a2eb", "#4bc0c0", "#ff9f40", "#ff6384", "#9966ff", "#c9cbcf"],
+                title="月度运行成本构成占比"
+            )
+            # 配置文字样式，百分比+标签外部展示
+            fig.update_traces(
+                textposition="outside",
+                texttemplate="%{label}<br>%{percent:.1%}",
+                textfont_size=14
+            )
+            fig.update_layout(
+                font_size=14,
+                showlegend=False,
+                title_x=0.5,
+                width=700,
+                height=600
+            )
 
             col1, col2 = st.columns([1, 1.2])
             with col1:
@@ -922,17 +945,17 @@ elif page == "💰 成本经济核算":
                 cost_data = pd.DataFrame({
                     "成本类别": ["电费", "药剂费", "污泥处置费", "人员工资", "设备维修费", "其他杂费"],
                     "月度费用 (元)": [power_cost, med_cost, sludge_cost, staff_cost, maintain_cost, other_cost],
-                    "占比": [f"{v/total_month*100:.1f}%" for v in values]
+                    "占比": [f"{v / total_month * 100:.1f}%" for v in values]
                 })
                 st.dataframe(cost_data, use_container_width=True, hide_index=True)
 
                 st.markdown("---")
                 st.metric("📌 月度运行总成本", f"{total_month:,.2f} 元")
-                st.metric("📌 年度运行总成本", f"{total_month*12:,.2f} 元")
+                st.metric("📌 年度运行总成本", f"{total_month * 12:,.2f} 元")
                 st.metric("📌 吨水处理综合成本", f"{unit_cost:.3f} 元/吨")
 
             with col2:
-                st.pyplot(fig)
+                st.plotly_chart(fig, use_container_width=True)
 
 
 # ================= 页面7：报表导出 =================
