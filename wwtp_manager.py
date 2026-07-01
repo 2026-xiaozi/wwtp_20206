@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 
 # ================= 全局字体配置（解决云端中文乱码方框） =================
-plt.rcParams['font.sans-serif'] = ['WenQuanYi Zen Hei']
+plt.rcParams['font.sans-serif'] = ['SimHei','WenQuanYi Zen Hei','AR PL UMing CN']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ================= 页面基础配置 =================
