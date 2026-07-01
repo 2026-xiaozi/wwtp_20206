@@ -4,6 +4,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from io import BytesIO
 
+# ================= 全局字体配置（解决云端中文乱码方框） =================
+plt.rcParams['font.sans-serif'] = ['WenQuanYi Zen Hei']
+plt.rcParams['axes.unicode_minus'] = False
+
 # ================= 页面基础配置 =================
 st.set_page_config(
     page_title="五段Bardenpho污水厂运维管理系统",
