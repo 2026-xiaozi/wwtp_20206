@@ -85,11 +85,11 @@ if 'base_params' not in st.session_state:
         'naclo_price': 450,    # 次氯酸钠单价 元/吨
         'pam_price': 12000,     # PAM单价 元/吨
         'hcl_price': 200,       # 盐酸单价 元/吨（pH调节）
-        'sludge_dispose_price': 200,  # 污泥处置单价 元/吨湿泥
+        'sludge_dispose_price': 220,  # 污泥处置单价 元/吨湿泥
         'staff_num': 12,        # 运维人数
         'staff_salary': 6800,   # 人均月薪 元
-        'maintain_cost': 18000, # 月度维修费 元
-        'other_cost': 8000      # 其他杂费 元/月
+        'maintain_cost': 36000, # 月度维修费 元
+        'other_cost': 22000      # 其他杂费 元/月
     }
 
 if 'bio_result' not in st.session_state:
@@ -907,12 +907,23 @@ elif page == "💰 成本经济核算":
             labels = ["电费", "药剂费", "污泥处置", "人员工资", "维修耗材", "其他"]
             values = [power_cost, med_cost, sludge_cost, staff_cost, maintain_cost, other_cost]
             colors = ["#36a2eb", "#4bc0c0", "#ff9f40", "#ff6384", "#9966ff", "#c9cbcf"]
+            # 占比阈值：≥6% 的扇区上显示“类别+百分比”，<6% 的扇区上只显示百分比（类别靠图例查看），文本嵌入扇形内部
+            total_cost = sum(values)
+            slice_texts = []
+            for i, v in enumerate(values):
+                pct = v / total_cost * 100
+                if pct >= 6:
+                    slice_texts.append(f"{labels[i]}<br>{pct:.1f}%")
+                else:
+                    slice_texts.append(f"{pct:.1f}%")
             fig = go.Figure(data=[go.Pie(
                 labels=labels,
                 values=values,
                 hole=0.4,
+                text=slice_texts,
+                textinfo="text",
+                textposition="inside",
                 marker=dict(colors=colors, line=dict(color="white", width=2)),
-                textinfo="label+percent",
                 textfont=dict(size=13, family="Microsoft YaHei, PingFang SC, Hiragino Sans GB, sans-serif"),
                 hovertemplate="%{label}<br>%{value:,.0f} 元<br>占比 %{percent}<extra></extra>"
             )])
@@ -925,10 +936,11 @@ elif page == "💰 成本经济核算":
                 ),
                 font=dict(family="Microsoft YaHei, PingFang SC, Hiragino Sans GB, sans-serif"),
                 showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
-                margin=dict(t=50, b=40, l=20, r=20),
-                width=500,
-                height=450
+                legend=dict(orientation="h", yanchor="bottom", y=-0.18, xanchor="center", x=0.5),
+                margin=dict(t=50, b=60, l=30, r=30),
+                width=600,
+                height=520,
+                autosize=False
             )
 
             col1, col2 = st.columns([1, 1.2])
