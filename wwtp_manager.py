@@ -2,12 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import plotly.express as px
 from io import BytesIO
-
-# ================= 全局字体配置（解决云端中文乱码方框） =================
-plt.rcParams['font.sans-serif'] = ['SimHei','WenQuanYi Zen Hei','AR PL UMing CN']
-plt.rcParams['axes.unicode_minus'] = False
 
 # ================= 页面基础配置 =================
 st.set_page_config(
@@ -28,12 +23,11 @@ if not st.session_state.logged_in:
     with col2:
         input_pwd = st.text_input("请输入访问密码", type="password")
         if st.button("登录系统", type="primary", use_container_width=True):
-            # 从平台后台读取正确密码（本地测试可临时写死，部署后走secrets）
-            # 兼容本地无secrets文件、云端有secrets的两种场景
+            # 从平台后台读取正确密码（本地无 secrets.toml 时自动回退默认密码）
             try:
                 correct_pwd = st.secrets["access_password"]
-            except:
-                correct_pwd = "123456"  # 本地默认密码
+            except Exception:
+                correct_pwd = "123456"
             if input_pwd == correct_pwd:
                 st.session_state.logged_in = True
                 st.success("登录成功，正在进入系统...")
@@ -219,7 +213,7 @@ elif page == "💧 水力与负荷校核":
 
     if st.button("开始校核计算", type="primary"):
         Q = bp['Q_actual']
-        V_aero_total = bp['V_aero1']
+        V_aero_total = bp['V_aero1'] + bp['V_aero2']   # 曝气池总容积 = 好氧1 + 好氧2
 
         # ========== 1. 水力停留时间HRT ==========
         hrt_total = bp['V_total'] / Q * 24
@@ -339,18 +333,18 @@ elif page == "🧪 生化核心计算":
         V_anox2 = bp['V_anox2']
 
         # ========== 1. 回流比与脱氮校核 ==========
-        total_return = R + R1
-        # 缺氧1反硝化后硝态氮浓度
-        no3_after_anox1 = tn_in / (1 + total_return)
-        # 好氧1完成全部硝化，氨氮转化为硝态氮
-        no3_aero1 = no3_after_anox1 + nh3_in * 0.95
-        # 自流进入缺氧2深度反硝化（反硝化效率按70%计）
-        no3_after_anox2 = no3_aero1 * (1 - 0.7)
-        # 出水总氮（含残留氨氮、有机氮）
+        total_return = R + R1   # 仅用于展示"系统总回流倍数"
+        # 脱氮质量平衡：仅内回流R1携带硝态氮回到缺氧池（污泥回流R基本不带硝态氮，不计入）
+        # 缺氧1完全反硝化后，残留TN浓度≈ TN_in / (1 + R1)（已包含硝化生成的氮）
+        no3_res_stage1 = tn_in / (1 + R1)
+        # 自流进入缺氧2深度反硝化（反硝化效率按70%计，该比例依容积/碳源而定）
+        no3_after_anox2 = no3_res_stage1 * (1 - 0.7)
+        # 出水总氮（含残留有机氮、出水氨氮，取3 mg/L近似）
         tn_theory = no3_after_anox2 + 3
 
         tn_status = "✅ 当前回流比可满足TN目标" if tn_theory <= tn_out_target else "⚠️ 内回流不足，需加大R1回流比"
-        min_R1 = (tn_in / tn_out_target - 1 - R) * 100
+        # 满足出水TN目标所需最小内回流比（基于缺氧1主反硝化段，保守值，仅与R1相关）
+        min_R1 = (tn_in / tn_out_target - 1) * 100
 
         # ========== 2. 碳源投加量计算 ==========
         # ========== 药剂参数配置（内置行业标准参数） ==========
@@ -375,15 +369,14 @@ elif page == "🧪 生化核心计算":
 
         # ========== 2. 碳源投加量计算 ==========
         tn_remove = tn_in - tn_out_target
-        endogenous_carbon = bod_in * 0.7  # 可生化内源碳
-        need_carbon_total = tn_remove * 4  # 反硝化总需COD（C/N=4）
+        endogenous_carbon = bod_in * 0.5  # 可生化内源碳（按易降解COD≈50% BOD计，保守取值）
+        need_carbon_total = tn_remove * 4  # 反硝化总需COD（C/N=4，含安全余量；理论最小约2.86 gCOD/gNO3-N）
         carbon_deficit = max(0, need_carbon_total - endogenous_carbon)
-        # 两级缺氧碳源分配 7:3
+        # 两级缺氧碳源分配 7:3，并分别换算为实际药剂投加量后求和（使分配参与投加量计算）
         carbon_anox1 = carbon_deficit * 0.7
         carbon_anox2 = carbon_deficit * 0.3
-        # 按所选碳源换算实际药剂投加量
         carbon_cfg = carbon_agent_config[carbon_agent_type]
-        carbon_dosage = carbon_deficit / carbon_cfg["cod_eq"]  # mg/L
+        carbon_dosage = (carbon_anox1 + carbon_anox2) / carbon_cfg["cod_eq"]  # mg/L，两级之和
         carbon_daily = carbon_dosage * Q / 1000 / 1000  # 吨/天
         cn_ratio = cod_in / tn_in
         carbon_status = "✅ 进水C/N充足，无需外加碳源" if carbon_deficit == 0 else f"⚠️ C/N比仅{cn_ratio:.1f}，需补充外加碳源"
@@ -405,29 +398,29 @@ elif page == "🧪 生化核心计算":
         phos_dosage = tp_need_chem * phos_cfg["dosage_factor"]  # mg/L
         phos_daily = phos_dosage * Q / 1000 / 1000  # 吨/天
 
-        # ========== 4. 剩余污泥与污泥龄（GB50014‑2021标准公式） ==========
+        # ========== 4. 剩余污泥与污泥龄 ==========
         bod_remove = bod_in - bod_eff
-        delta_x_v = (Y * Q * bod_remove / 1000) - (Kd * V_total * mlss * f / 1000)
-        delta_x_v = max(delta_x_v, 0)
+
+        # --- 4.1 污泥龄 SRT（按实际排泥量计算，仅硝化段‑好氧1池） ---
+        V_aero1 = bp["V_aero1"]
+        waste_mlss = mlss * 2  # 排泥污泥浓度默认是生化池MLSS的2倍
+        aer1_total_sludge = V_aero1 * mlss / 1000          # 好氧1池总污泥质量(kg)
+        daily_waste_sludge = waste_sludge_volume * waste_mlss / 1000  # 每日外排污泥质量(kg/d)
+        if daily_waste_sludge > 0:
+            srt = aer1_total_sludge / daily_waste_sludge
+        else:
+            srt = 999
+
+        # --- 4.2 剩余污泥产量（表观产率系数法，与SRT一致，恒为非负） ---
+        # 注：直接用 ΔX=Y·Q·ΔBOD−Kd·V·X 在MLSS/排泥独立输入时可能出现负值，
+        #      故改用表观产率 Y_obs=Y/(1+Kd·SRT) 关联系统SRT，结果稳定合理。
+        Y_obs = Y / (1 + Kd * srt)
+        delta_x_v = Y_obs * Q * bod_remove / 1000          # kg VSS/d
         ash_fraction = 0.20
         delta_x_total = delta_x_v / (1 - ash_fraction)
         water_content = 0.992
         dry_ratio = 1 - water_content
         sludge_wet = delta_x_total / dry_ratio / 1000
-
-        # 2、严格按照你给定的公式单独计算SRT（仅硝化段‑好氧1池）
-        V_aero1 = bp["V_aero1"]
-        waste_mlss = mlss * 2  # 排泥污泥浓度默认是生化池MLSS的2倍
-        # 分子：好氧1池总污泥质量(kg)
-        aer1_total_sludge = V_aero1 * mlss / 1000
-        # 分母：每日外排污泥质量(kg/d)
-        daily_waste_sludge = waste_sludge_volume * waste_mlss / 1000
-
-        # 防止除零报错
-        if daily_waste_sludge > 0:
-            srt = aer1_total_sludge / daily_waste_sludge
-        else:
-            srt = 999
 
 
 
@@ -437,8 +430,8 @@ elif page == "🧪 生化核心计算":
         tn_rate = tn_remove / tn_in * 100
         tp_rate = (tp_in - tp_out_target) / tp_in * 100
 
-        # 将更新后的污泥参数存入session_state
-        st.session_state.bio_result.update({
+        # 保存结果供成本模块调用（单一赋值，避免重复写入导致键丢失）
+        st.session_state.bio_result = {
             'phos_daily': phos_daily,
             'phos_agent_name': phos_agent_type,
             'phos_price_key': phos_cfg["price_key"],
@@ -451,20 +444,6 @@ elif page == "🧪 生化核心计算":
             'srt': srt,
             'daily_waste_sludge_vol': waste_sludge_volume,
             'waste_mlss': waste_mlss
-        })
-
-        # 保存结果供成本模块调用
-        st.session_state.bio_result = {
-            'phos_daily': phos_daily,
-            'phos_agent_name': phos_agent_type,
-            'phos_price_key': phos_cfg["price_key"],
-            'carbon_daily': carbon_daily,
-            'carbon_agent_name': carbon_agent_type,
-            'carbon_price_key': carbon_cfg["price_key"],
-            'sludge_dry_daily': delta_x_total,
-            'sludge_wet_daily': sludge_wet,
-            'tn_theory': tn_theory,
-            'srt': srt
         }
 
         # ========== 展示结果 ==========
@@ -477,7 +456,7 @@ elif page == "🧪 生化核心计算":
             with col1:
                 st.metric("污泥回流比", f"{R*100:.0f}%")
                 st.metric("内回流比 R1（好氧1→缺氧1）", f"{R1*100:.0f}%")
-                st.metric("系统总回流倍数", f"{1+total_return:.1f}倍")
+                st.metric("系统总回流比 (R+R1)", f"{total_return:.1f}倍")
             with col2:
                 st.metric("理论出水TN", f"{tn_theory:.2f} mg/L")
                 st.metric("达标所需最小内回流R1", f"{max(min_R1, 100):.1f}%")
@@ -535,8 +514,9 @@ elif page == "🧪 生化核心计算":
             st.subheader("5. 剩余污泥、污泥龄与去除率")
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("污泥龄 SRT", f"{srt:.1f} d")
+                st.metric("污泥龄 SRT（硝化段）", f"{srt:.1f} d")
                 st.info("✅ 满足硝化菌世代时间要求" if srt > 10 else "⚠️ 泥龄偏短，硝化菌易流失")
+                st.caption("注：此处SRT仅按硝化段(好氧1池)污泥量/排泥量计算，为硝化安全泥龄下限；全系统SRT需用V_total核算")
                 st.metric("每日剩余干污泥", f"{delta_x_total:.2f} kg/d")
                 st.metric("湿污泥量（含水率99.2%）", f"{sludge_wet:.2f} m³/d")
             with col2:
@@ -593,6 +573,9 @@ elif page == "🏞️ 二沉池专项校核":
             st.metric("SVI 污泥体积指数", f"{svi:.1f} mL/g")
             st.info(svi_status)
             st.caption("正常范围：70 ~ 150 mL/g")
+
+        st.metric("二沉池水力停留时间 (HRT)", f"{hrt:.2f} h")
+        st.caption("推荐值：按最大时流量校核，一般 ≥ 1.5~2.0 h")
 
         st.markdown("---")
         st.subheader("故障处置建议")
@@ -908,36 +891,14 @@ elif page == "💰 成本经济核算":
             Q_month = bp['Q_actual'] * 30
             unit_cost = total_month / Q_month
 
-            # 构造Plotly绘图数据集
+            # 饼图
+            fig, ax = plt.subplots(figsize=(6, 5))
             labels = ["电费", "药剂费", "污泥处置", "人员工资", "维修耗材", "其他"]
             values = [power_cost, med_cost, sludge_cost, staff_cost, maintain_cost, other_cost]
-            cost_df_plot = pd.DataFrame({
-                "成本类别": labels,
-                "月度费用": values
-            })
-
-            # 绘制环形空心饼图
-            fig = px.pie(
-                cost_df_plot,
-                values="月度费用",
-                names="成本类别",
-                hole=0.4,  # 空心环形
-                color_discrete_sequence=["#36a2eb", "#4bc0c0", "#ff9f40", "#ff6384", "#9966ff", "#c9cbcf"],
-                title="月度运行成本构成占比"
-            )
-            # 配置文字样式，百分比+标签外部展示
-            fig.update_traces(
-                textposition="outside",
-                texttemplate="%{label}<br>%{percent:.1%}",
-                textfont_size=14
-            )
-            fig.update_layout(
-                font_size=14,
-                showlegend=False,
-                title_x=0.5,
-                width=700,
-                height=600
-            )
+            colors = ["#36a2eb", "#4bc0c0", "#ff9f40", "#ff6384", "#9966ff", "#c9cbcf"]
+            ax.pie(values, labels=labels, autopct="%1.1f%%", colors=colors, startangle=90,
+                   wedgeprops=dict(width=0.4, edgecolor="white"))
+            ax.set_title("月度运行成本构成占比", fontsize=12)
 
             col1, col2 = st.columns([1, 1.2])
             with col1:
@@ -945,17 +906,17 @@ elif page == "💰 成本经济核算":
                 cost_data = pd.DataFrame({
                     "成本类别": ["电费", "药剂费", "污泥处置费", "人员工资", "设备维修费", "其他杂费"],
                     "月度费用 (元)": [power_cost, med_cost, sludge_cost, staff_cost, maintain_cost, other_cost],
-                    "占比": [f"{v / total_month * 100:.1f}%" for v in values]
+                    "占比": [f"{v/total_month*100:.1f}%" for v in values]
                 })
                 st.dataframe(cost_data, use_container_width=True, hide_index=True)
 
                 st.markdown("---")
                 st.metric("📌 月度运行总成本", f"{total_month:,.2f} 元")
-                st.metric("📌 年度运行总成本", f"{total_month * 12:,.2f} 元")
+                st.metric("📌 年度运行总成本", f"{total_month*12:,.2f} 元")
                 st.metric("📌 吨水处理综合成本", f"{unit_cost:.3f} 元/吨")
 
             with col2:
-                st.plotly_chart(fig, use_container_width=True)
+                st.pyplot(fig)
 
 
 # ================= 页面7：报表导出 =================
