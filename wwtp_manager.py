@@ -379,7 +379,10 @@ elif page == "🧪 生化核心计算":
         carbon_dosage = (carbon_anox1 + carbon_anox2) / carbon_cfg["cod_eq"]  # mg/L，两级之和
         carbon_daily = carbon_dosage * Q / 1000 / 1000  # 吨/天
         cn_ratio = cod_in / tn_in
-        carbon_status = "✅ 进水C/N充足，无需外加碳源" if carbon_deficit == 0 else f"⚠️ C/N比仅{cn_ratio:.1f}，需补充外加碳源"
+        if cn_ratio < 4:
+            carbon_status = f"⚠️ C/N比仅{cn_ratio:.1f}，需补充碳源"
+        else:
+            carbon_status = f"✅ C/N比{cn_ratio:.1f}，无需补充碳源"
 
         # ========== 碳磷比计算与判定 ==========
         cp_ratio = bod_in / tp_in
@@ -495,8 +498,6 @@ elif page == "🧪 生化核心计算":
                 st.write(f"内源可利用碳源：{endogenous_carbon:.1f} mg/L")
                 st.write(f"碳源总缺口：{carbon_deficit:.1f} mg/L")
             with col2:
-                st.write(f"- 第一缺氧区碳源分配：{carbon_anox1:.1f} mg/L（主反硝化）")
-                st.write(f"- 第二缺氧区碳源分配：{carbon_anox2:.1f} mg/L（深度脱氮）")
                 st.metric(f"{carbon_agent_type}投加浓度", f"{carbon_dosage:.2f} mg/L")
                 st.metric(f"{carbon_agent_type}日投加量", f"{carbon_daily:.3f} 吨/天")
 
