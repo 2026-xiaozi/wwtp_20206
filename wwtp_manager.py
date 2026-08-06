@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 from io import BytesIO
 
 # ================= 页面基础配置 =================
@@ -36,8 +37,13 @@ if not st.session_state.logged_in:
                 st.error("密码错误，请重试")
     st.stop()  # 密码验证不通过，停止执行后面所有代码
 
-# matplotlib中文显示
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+# matplotlib中文显示：设置跨平台中文字体回退栈，覆盖 Windows/macOS/Linux 及常见服务器环境
+plt.rcParams["font.sans-serif"] = [
+    "Microsoft YaHei", "SimHei", "SimSun", "DengXian",
+    "PingFang SC", "Hiragino Sans GB", "STHeiti",
+    "WenQuanYi Micro Hei", "Noto Sans CJK SC", "Source Han Sans CN",
+    "Arial Unicode MS", "DejaVu Sans"
+]
 plt.rcParams["axes.unicode_minus"] = False
 
 # ================= 全局参数初始化 =================
@@ -897,14 +903,33 @@ elif page == "💰 成本经济核算":
             Q_month = bp['Q_actual'] * 30
             unit_cost = total_month / Q_month
 
-            # 饼图
-            fig, ax = plt.subplots(figsize=(6, 5))
+            # 饼图（使用 Plotly 渲染为交互式 HTML/SVG，字体由客户端浏览器负责，避免服务器缺中文字体导致方块）
             labels = ["电费", "药剂费", "污泥处置", "人员工资", "维修耗材", "其他"]
             values = [power_cost, med_cost, sludge_cost, staff_cost, maintain_cost, other_cost]
             colors = ["#36a2eb", "#4bc0c0", "#ff9f40", "#ff6384", "#9966ff", "#c9cbcf"]
-            ax.pie(values, labels=labels, autopct="%1.1f%%", colors=colors, startangle=90,
-                   wedgeprops=dict(width=0.4, edgecolor="white"))
-            ax.set_title("月度运行成本构成占比", fontsize=12)
+            fig = go.Figure(data=[go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.4,
+                marker=dict(colors=colors, line=dict(color="white", width=2)),
+                textinfo="label+percent",
+                textfont=dict(size=13, family="Microsoft YaHei, PingFang SC, Hiragino Sans GB, sans-serif"),
+                hovertemplate="%{label}<br>%{value:,.0f} 元<br>占比 %{percent}<extra></extra>"
+            )])
+            fig.update_layout(
+                title=dict(
+                    text="月度运行成本构成占比",
+                    x=0.5,
+                    xanchor="center",
+                    font=dict(size=16, family="Microsoft YaHei, PingFang SC, Hiragino Sans GB, sans-serif")
+                ),
+                font=dict(family="Microsoft YaHei, PingFang SC, Hiragino Sans GB, sans-serif"),
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
+                margin=dict(t=50, b=40, l=20, r=20),
+                width=500,
+                height=450
+            )
 
             col1, col2 = st.columns([1, 1.2])
             with col1:
@@ -922,7 +947,7 @@ elif page == "💰 成本经济核算":
                 st.metric("📌 吨水处理综合成本", f"{unit_cost:.3f} 元/吨")
 
             with col2:
-                st.pyplot(fig)
+                st.plotly_chart(fig, use_container_width=True)
 
 
 # ================= 页面7：报表导出 =================
