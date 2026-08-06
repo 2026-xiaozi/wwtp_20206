@@ -46,6 +46,11 @@ plt.rcParams["font.sans-serif"] = [
 ]
 plt.rcParams["axes.unicode_minus"] = False
 
+# 计算结果 schema 版本号：用于识别 session_state 中残留的旧版计算结果。
+# 代码更新后，旧 dict 可能缺少新字段（如 bio['R']），据此安全提示重算而非崩溃。
+RESULT_SCHEMA = "2026-08-06"
+
+
 # ================= 全局参数初始化 =================
 if 'base_params' not in st.session_state:
     st.session_state.base_params = {
@@ -253,30 +258,54 @@ elif page == "💧 水力与负荷校核":
         else:
             ns_status = "⚠️ 负荷过高，硝化效果受影响"
 
-        # ========== 结果展示 ==========
+        # ========== 结果存储（持久化，供切换页面后展示） ==========
+        conclusion = f"""
+        当前工况下，五段Bardenpho(或Phoredox)系统水力停留时间{hrt_total_status.replace('✅ ','').replace('⚠️ ','')}脱氮除磷要求；
+        污泥负荷{ns_status.replace('✅ ','').replace('⚠️ ','')}；
+        若进水浓度进一步升高，可通过提高MLSS、调控溶解氧、加大内回流比、调整外回流比、补充外加碳源、投加除磷剂等措施保障出水达标。
+        """
+        st.session_state.hydro_result = {
+            'schema': RESULT_SCHEMA,
+            'hrt_total': hrt_total, 'hrt_ana': hrt_ana, 'hrt_anox1': hrt_anox1,
+            'hrt_aero1': hrt_aero1, 'hrt_anox2': hrt_anox2, 'hrt_aero2': hrt_aero2,
+            'hrt_aero_total': hrt_aero_total,
+            'hrt_total_status': hrt_total_status, 'hrt_ana_status': hrt_ana_status,
+            'hrt_anox1_status': hrt_anox1_status, 'hrt_aero1_status': hrt_aero1_status,
+            'hrt_anox2_status': hrt_anox2_status, 'hrt_aero2_status': hrt_aero2_status,
+            'ns_bod': ns_bod, 'ns_cod': ns_cod, 'ns_status': ns_status,
+            'conclusion': conclusion
+        }
+
+
+
+    # ===== 持久展示：切换页面后仍保留计算结果 =====
+    _hydro_stale = bool(st.session_state.get('hydro_result')) and st.session_state.hydro_result.get('schema') != RESULT_SCHEMA
+    if _hydro_stale:
+        st.info("计算结果格式已更新，请重新点击本页「开始校核计算」按钮以刷新结果。")
+    if st.session_state.get('hydro_result') and st.session_state.get('hydro_result').get('schema') == RESULT_SCHEMA:
+        res = st.session_state.hydro_result
         st.markdown("---")
         tab1, tab2 = st.tabs(["水力停留时间(HRT)", "污泥负荷校核"])
         with tab1:
             st.subheader("1. 各功能区水力停留时间")
             hrt_df = pd.DataFrame({
                 "功能区": ["厌氧池", "第一缺氧池", "第一好氧池", "第二缺氧池", "第二好氧池", "曝气池合计", "生化池总HRT"],
-                "停留时间 (h)": [hrt_ana, hrt_anox1, hrt_aero1, hrt_anox2, hrt_aero2, hrt_aero_total, hrt_total],
+                "停留时间 (h)": [res['hrt_ana'], res['hrt_anox1'], res['hrt_aero1'], res['hrt_anox2'], res['hrt_aero2'], res['hrt_aero_total'], res['hrt_total']],
                 "推荐范围 (h)": ["0.5~2", "2~4", "4~12", "2~4", "0.5~2", "4.5~14", "≥12"],
-                "判定": [hrt_ana_status, hrt_anox1_status, hrt_aero1_status, hrt_anox2_status, hrt_aero2_status, "—", hrt_total_status]
+                "判定": [res['hrt_ana_status'], res['hrt_anox1_status'], res['hrt_aero1_status'], res['hrt_anox2_status'], res['hrt_aero2_status'], "—", res['hrt_total_status']]
             })
             st.dataframe(hrt_df, use_container_width=True, hide_index=True)
             st.info("第二好氧池仅用于吹脱氮气与维持DO，不承担硝化功能，停留时间按短HRT设计")
-
 
         with tab2:
             st.subheader("2. 系统污泥负荷校核")
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("BOD污泥负荷 Ns", f"{ns_bod:.4f} kgBOD/(kgMLSS·d)")
-                st.info(ns_status)
+                st.metric("BOD污泥负荷 Ns", f"{res['ns_bod']:.4f} kgBOD/(kgMLSS·d)")
+                st.info(res['ns_status'])
                 st.caption("脱氮除磷工艺推荐污泥负荷：0.05~0.15 kgBOD/(kgMLSS·d)")
             with col2:
-                st.metric("COD污泥负荷", f"{ns_cod:.4f} kgCOD/(kgMLSS·d)")
+                st.metric("COD污泥负荷", f"{res['ns_cod']:.4f} kgCOD/(kgMLSS·d)")
 
             st.markdown("---")
             st.write("**污泥负荷调控建议：**")
@@ -285,13 +314,7 @@ elif page == "💧 水力与负荷校核":
 
         st.markdown("---")
         st.subheader("二、综合校核结论")
-        conclusion = f"""
-        当前工况下，五段Bardenpho(或Phoredox)系统水力停留时间{hrt_total_status.replace('✅ ','').replace('⚠️ ','')}脱氮除磷要求；
-        污泥负荷{ns_status.replace('✅ ','').replace('⚠️ ','')}；
-        若进水浓度进一步升高，可通过提高MLSS、调控溶解氧、加大内回流比、调整外回流比、补充外加碳源、投加除磷剂等措施保障出水达标。
-        """
-        st.write(conclusion)
-
+        st.write(res['conclusion'])
 
 # ================= 页面3：生化核心计算 =================
 elif page == "🧪 生化核心计算":
@@ -446,6 +469,7 @@ elif page == "🧪 生化核心计算":
 
         # 保存结果供成本模块调用（单一赋值，避免重复写入导致键丢失）
         st.session_state.bio_result = {
+            'schema': RESULT_SCHEMA,
             'phos_daily': phos_daily,
             'phos_agent_name': phos_agent_type,
             'phos_price_key': phos_cfg["price_key"],
@@ -457,10 +481,30 @@ elif page == "🧪 生化核心计算":
             'tn_theory': tn_theory,
             'srt': srt,
             'daily_waste_sludge_vol': waste_sludge_volume,
-            'waste_mlss': waste_mlss
+            'waste_mlss': waste_mlss,
+            # —— 以下为界面持久化展示所需的派生值 ——
+            'R': R, 'R1': R1, 'total_return': total_return,
+            'min_R1': min_R1, 'tn_status': tn_status,
+            'carbon_agent_type': carbon_agent_type, 'cn_ratio': cn_ratio,
+            'carbon_status': carbon_status, 'cp_ratio': cp_ratio,
+            'cp_need_carbon': cp_need_carbon, 'cp_status': cp_status,
+            'tn_remove': tn_remove, 'need_carbon_total': need_carbon_total,
+            'endogenous_carbon': endogenous_carbon, 'carbon_deficit': carbon_deficit,
+            'carbon_dosage': carbon_dosage,
+            'phos_agent_type': phos_agent_type, 'tp_bio_remove': tp_bio_remove,
+            'tp_need_chem': tp_need_chem, 'phos_dosage': phos_dosage,
+            'cod_rate': cod_rate, 'nh3_rate': nh3_rate, 'tn_rate': tn_rate, 'tp_rate': tp_rate
         }
 
-        # ========== 展示结果 ==========
+
+
+
+    # ===== 持久展示：切换页面后仍保留计算结果 =====
+    _stale = bool(st.session_state.get('bio_result')) and st.session_state.bio_result.get('schema') != RESULT_SCHEMA
+    if _stale:
+        st.info("计算结果格式已更新，请重新点击本页「计算」按钮以刷新结果。")
+    if st.session_state.get('bio_result') and st.session_state.get('bio_result').get('schema') == RESULT_SCHEMA:
+        bio = st.session_state.get('bio_result')
         st.markdown("---")
         tab1, tab2, tab3, tab4, tab5 = st.tabs(["回流比脱氮校核", "DO分区控制", "碳源投加计算", "除磷药剂计算", "污泥与去除率"])
 
@@ -468,20 +512,20 @@ elif page == "🧪 生化核心计算":
             st.subheader("1. 回流比校核与脱氮效果")
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("污泥回流比", f"{R*100:.0f}%")
-                st.metric("内回流比 R1（好氧1→缺氧1）", f"{R1*100:.0f}%")
-                st.metric("系统总回流比 (R+R1)", f"{total_return:.1f}倍")
+                st.metric("污泥回流比", f"{bio['R']*100:.0f}%")
+                st.metric("内回流比 R1（好氧1→缺氧1）", f"{bio['R1']*100:.0f}%")
+                st.metric("系统总回流比 (R+R1)", f"{bio['total_return']:.1f}倍")
             with col2:
-                st.metric("理论出水TN", f"{tn_theory:.2f} mg/L")
-                st.metric("达标所需最小内回流R1", f"{max(min_R1, 100):.1f}%")
-                st.info(tn_status)
-            st.write("💡 调节建议：氨氮偏高时优先加大内回流R1；总氮深度达标可配合缺氧2外加碳源")
+                st.metric("理论出水TN", f"{bio['tn_theory']:.2f} mg/L")
+                st.metric("达标所需最小内回流R1", f"{max(bio['min_R1'], 100):.1f}%")
+                st.info(bio['tn_status'])
+            st.write("调节建议：氨氮偏高时优先加大内回流R1；总氮深度达标可配合缺氧2外加碳源")
 
         with tab2:
             st.subheader("2. 各功能区溶解氧DO控制标准")
             do_data = pd.DataFrame({
                 "功能区": ["厌氧池", "第一缺氧池", "第一好氧池", "第二缺氧池", "第二好氧池"],
-                "DO控制范围 (mg/L)": ["< 0.2", "< 0.5", "2.0 ~ 3.0", "< 0.3", "1.0 ~ 2.0"],
+                "DO控制范围 (mg/L)": ["< 0.2", "< 0.5", "1.5 ~ 3.0", "< 0.3", "1.0 ~ 2.0"],
                 "控制要点": [
                     "保证聚磷菌释磷环境，DO过高会彻底失效除磷",
                     "主反硝化区，控制DO减少碳源浪费",
@@ -493,52 +537,50 @@ elif page == "🧪 生化核心计算":
             st.dataframe(do_data, use_container_width=True, hide_index=True)
 
         with tab3:
-            st.subheader(f"3. 碳源投加量计算（{carbon_agent_type}）")
+            st.subheader(f"3. 碳源投加量计算（{bio['carbon_agent_type']}）")
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("进水C/N比", f"{cn_ratio:.1f}")
-                st.info(carbon_status)
-                st.metric("进水碳磷比 (BOD₅/TP)", f"{cp_ratio:.1f}")
-                if cp_need_carbon:
-                    st.warning(cp_status)
+                st.metric("进水C/N比", f"{bio['cn_ratio']:.1f}")
+                st.info(bio['carbon_status'])
+                st.metric("进水碳磷比 (BOD₅/TP)", f"{bio['cp_ratio']:.1f}")
+                if bio['cp_need_carbon']:
+                    st.warning(bio['cp_status'])
                 else:
-                    st.success(cp_status)
+                    st.success(bio['cp_status'])
                 st.divider()
-                st.write(f"总需脱除总氮：{tn_remove:.1f} mg/L")
-                st.write(f"理论总需COD：{need_carbon_total:.1f} mg/L")
-                st.write(f"内源可利用碳源：{endogenous_carbon:.1f} mg/L")
-                st.write(f"碳源总缺口：{carbon_deficit:.1f} mg/L")
+                st.write(f"总需脱除总氮：{bio['tn_remove']:.1f} mg/L")
+                st.write(f"理论总需COD：{bio['need_carbon_total']:.1f} mg/L")
+                st.write(f"内源可利用碳源：{bio['endogenous_carbon']:.1f} mg/L")
+                st.write(f"碳源总缺口：{bio['carbon_deficit']:.1f} mg/L")
             with col2:
-                st.metric(f"{carbon_agent_type}投加浓度", f"{carbon_dosage:.2f} mg/L")
-                st.metric(f"{carbon_agent_type}日投加量", f"{carbon_daily:.3f} 吨/天")
+                st.metric(f"{bio['carbon_agent_type']}投加浓度", f"{bio['carbon_dosage']:.2f} mg/L")
+                st.metric(f"{bio['carbon_agent_type']}日投加量", f"{bio['carbon_daily']:.3f} 吨/天")
 
         with tab4:
-            st.subheader(f"4. 化学除磷药剂计算（{phos_agent_type}）")
+            st.subheader(f"4. 化学除磷药剂计算（{bio['phos_agent_type']}）")
             col1, col2 = st.columns(2)
             with col1:
-                st.write(f"生物除磷量：{tp_bio_remove:.2f} mg/L")
-                st.write(f"需化学去除磷量：{tp_need_chem:.2f} mg/L")
+                st.write(f"生物除磷量：{bio['tp_bio_remove']:.2f} mg/L")
+                st.write(f"需化学去除磷量：{bio['tp_need_chem']:.2f} mg/L")
             with col2:
-                st.metric(f"{phos_agent_type}投加浓度", f"{phos_dosage:.2f} mg/L")
-                st.metric(f"{phos_agent_type}日投加量", f"{phos_daily:.3f} 吨/天")
+                st.metric(f"{bio['phos_agent_type']}投加浓度", f"{bio['phos_dosage']:.2f} mg/L")
+                st.metric(f"{bio['phos_agent_type']}日投加量", f"{bio['phos_daily']:.3f} 吨/天")
 
         with tab5:
             st.subheader("5. 剩余污泥、污泥龄与去除率")
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("污泥龄 SRT（硝化段）", f"{srt:.1f} d")
-                st.info("✅ 满足硝化菌世代时间要求" if srt > 10 else "⚠️ 泥龄偏短，硝化菌易流失")
+                st.metric("污泥龄 SRT（硝化段）", f"{bio['srt']:.1f} d")
+                st.info("满足硝化菌世代时间要求" if bio['srt'] > 10 else "泥龄偏短，硝化菌易流失")
                 st.caption("注：此处SRT仅按硝化段(好氧1池)污泥量/排泥量计算，为硝化安全泥龄下限；全系统SRT需用V_total核算")
-                st.metric("每日剩余干污泥", f"{delta_x_total:.2f} kg/d")
-                st.metric("湿污泥量（含水率99.2%）", f"{sludge_wet:.2f} m³/d")
+                st.metric("每日剩余干污泥", f"{bio['sludge_dry_daily']:.2f} kg/d")
+                st.metric("湿污泥量（含水率99.2%）", f"{bio['sludge_wet_daily']:.2f} m³/d")
             with col2:
                 st.write("#### 污染物去除率")
-                st.write(f"COD去除率：{cod_rate:.1f}%")
-                st.write(f"氨氮去除率：{nh3_rate:.1f}%")
-                st.write(f"总氮去除率：{tn_rate:.1f}%")
-                st.write(f"总磷去除率：{tp_rate:.1f}%")
-
-
+                st.write(f"COD去除率：{bio['cod_rate']:.1f}%")
+                st.write(f"氨氮去除率：{bio['nh3_rate']:.1f}%")
+                st.write(f"总氮去除率：{bio['tn_rate']:.1f}%")
+                st.write(f"总磷去除率：{bio['tp_rate']:.1f}%")
 # ================= 页面4：二沉池专项校核 =================
 elif page == "🏞️ 二沉池专项校核":
     st.header("🏞️ 二沉池专项校核")
@@ -572,34 +614,51 @@ elif page == "🏞️ 二沉池专项校核":
             svi_status = "⚠️ SVI过低，污泥老化"
 
         st.markdown("---")
+        # 持久化结果，便于切换页面后再次查看
+        st.session_state.settler_result = {
+            'schema': RESULT_SCHEMA,
+            'q_surface': q_surface, 'q_status': q_status,
+            'ssl': ssl, 'ssl_status': ssl_status,
+            'svi': svi, 'svi_status': svi_status,
+            'hrt': hrt
+        }
+        st.success("✅ 二沉池校核完成，结果已保存，可切换页面后再回来查看")
+
+
+
+    # ===== 持久展示：切换页面后仍保留计算结果 =====
+    _stale = bool(st.session_state.get('settler_result')) and st.session_state.settler_result.get('schema') != RESULT_SCHEMA
+    if _stale:
+        st.info("计算结果格式已更新，请重新点击本页「计算」按钮以刷新结果。")
+    if st.session_state.get('settler_result') and st.session_state.get('settler_result').get('schema') == RESULT_SCHEMA:
+        res = st.session_state.settler_result
+        st.markdown("---")
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("表面水力负荷", f"{q_surface:.3f} m³/(m²·h)")
-            st.info(q_status)
+            st.metric("表面水力负荷", f"{res['q_surface']:.3f} m³/(m²·h)")
+            st.info(res['q_status'])
             st.caption("推荐值：最大时 ≤ 0.6~1.5 m³/(m²·h)")
         with col2:
-            st.metric("固体表面负荷", f"{ssl:.2f} kgMLSS/(m²·d)")
-            st.info(ssl_status)
+            st.metric("固体表面负荷", f"{res['ssl']:.2f} kgMLSS/(m²·d)")
+            st.info(res['ssl_status'])
             st.caption("推荐值：≤ 150 kgMLSS/(m²·d)")
         with col3:
-            st.metric("SVI 污泥体积指数", f"{svi:.1f} mL/g")
-            st.info(svi_status)
+            st.metric("SVI 污泥体积指数", f"{res['svi']:.1f} mL/g")
+            st.info(res['svi_status'])
             st.caption("正常范围：70 ~ 150 mL/g")
 
-        st.metric("二沉池水力停留时间 (HRT)", f"{hrt:.2f} h")
+        st.metric("二沉池水力停留时间 (HRT)", f"{res['hrt']:.2f} h")
         st.caption("推荐值：按最大时流量校核，一般 ≥ 1.5~2.0 h")
 
         st.markdown("---")
         st.subheader("故障处置建议")
-        if svi >= 150:
+        if res['svi'] >= 150:
             st.warning("污泥膨胀风险：建议降低MLSS、加大排泥量、提高好氧池DO、控制进水有机负荷")
-        elif svi < 70:
+        elif res['svi'] < 70:
             st.warning("污泥老化：建议减少排泥、适当提高污泥负荷、检查进水营养比")
-        if ssl >= 150:
+        if res['ssl'] >= 150:
             st.warning("跑泥风险：建议提高污泥回流比、降低进水量、增加排泥频次")
         st.info("好氧池末端维持1.0~2.0mg/L DO，可有效防止二沉池内反硝化导致的污泥上浮")
-
-
 # ================= 页面5：工况调节建议 =================
 elif page == "⚙️ 工况调节建议":
     st.header("⚙️ 进水水质波动工况智能调节方案")
@@ -749,17 +808,17 @@ elif page == "💰 成本经济核算":
         st.subheader("一、全厂电耗成本核算")
         col1, col2 = st.columns(2)
         with col1:
-            aeration_kw = st.number_input("曝气风机总功率 (kW)", value=220)
-            backflow_kw = st.number_input("污泥回流泵总功率 (kW)", value=30)
-            internal_kw = st.number_input("内回流泵总功率 (kW)", value=45)
-            mix_kw = st.number_input("搅拌/推流器总功率 (kW)", value=25)
+            aeration_kw = st.number_input("曝气风机总功率 (kW)", value=220, key="cost_aeration_kw")
+            backflow_kw = st.number_input("污泥回流泵总功率 (kW)", value=30, key="cost_backflow_kw")
+            internal_kw = st.number_input("内回流泵总功率 (kW)", value=45, key="cost_internal_kw")
+            mix_kw = st.number_input("搅拌/推流器总功率 (kW)", value=25, key="cost_mix_kw")
         with col2:
-            pump_kw = st.number_input("进水泵房总功率 (kW)", value=55)
-            dewater_kw = st.number_input("污泥脱水系统功率 (kW)", value=37)
-            dewater_h = st.number_input("脱水系统日运行时长 (h)", value=8)
-            other_kw = st.number_input("辅助设备总功率 (kW)", value=20)
+            pump_kw = st.number_input("进水泵房总功率 (kW)", value=55, key="cost_pump_kw")
+            dewater_kw = st.number_input("污泥脱水系统功率 (kW)", value=37, key="cost_dewater_kw")
+            dewater_h = st.number_input("脱水系统日运行时长 (h)", value=8, key="cost_dewater_h")
+            other_kw = st.number_input("辅助设备总功率 (kW)", value=20, key="cost_other_kw")
 
-        if st.button("计算电耗成本", type="primary"):
+        if st.button("计算电耗成本", type="primary", key="cost_btn_power"):
             # 日电耗
             e_aeration = aeration_kw * 24
             e_backflow = backflow_kw * 24
@@ -777,42 +836,55 @@ elif page == "💰 成本经济核算":
             unit_cost = cost_day / Q
 
             st.session_state.power_cost_month = cost_month
+            st.session_state.power_result = {
+                'schema': RESULT_SCHEMA,
+                'e_aeration': e_aeration, 'e_backflow': e_backflow, 'e_internal': e_internal,
+                'e_mix': e_mix, 'e_pump': e_pump, 'e_dewater': e_dewater, 'e_other': e_other,
+                'e_total_day': e_total_day, 'cost_day': cost_day, 'cost_month': cost_month,
+                'unit_power': unit_power, 'unit_cost': unit_cost
+            }
 
+        # ===== 持久展示：切换页面后仍保留计算结果 =====
+        _stale = bool(st.session_state.get('power_result')) and st.session_state.power_result.get('schema') != RESULT_SCHEMA
+        if _stale:
+            st.info("计算结果格式已更新，请重新点击本页「计算」按钮以刷新结果。")
+        if st.session_state.get('power_result') and st.session_state.get('power_result').get('schema') == RESULT_SCHEMA:
+            res = st.session_state.power_result
             col1, col2 = st.columns(2)
             with col1:
                 st.write("#### 分项日电耗")
                 power_data = pd.DataFrame({
                     "设备类别": ["曝气系统", "污泥回流泵", "内回流泵", "搅拌推流器", "进水泵房", "污泥脱水", "辅助设备"],
-                    "日耗电量 (kWh)": [e_aeration, e_backflow, e_internal, e_mix, e_pump, e_dewater, e_other]
+                    "日耗电量 (kWh)": [res['e_aeration'], res['e_backflow'], res['e_internal'], res['e_mix'], res['e_pump'], res['e_dewater'], res['e_other']]
                 })
                 st.dataframe(power_data, use_container_width=True, hide_index=True)
             with col2:
-                st.metric("日总耗电量", f"{e_total_day:.1f} kWh")
-                st.metric("日电费", f"{cost_day:.2f} 元")
-                st.metric("月电费", f"{cost_month:,.2f} 元")
-                st.metric("吨水电耗", f"{unit_power:.3f} kWh/m³")
-                st.metric("吨水电费", f"{unit_cost:.3f} 元/m³")
+                st.metric("日总耗电量", f"{res['e_total_day']:.1f} kWh")
+                st.metric("日电费", f"{res['cost_day']:.2f} 元")
+                st.metric("月电费", f"{res['cost_month']:,.2f} 元")
+                st.metric("吨水电耗", f"{res['unit_power']:.3f} kWh/m³")
+                st.metric("吨水电费", f"{res['unit_cost']:.3f} 元/m³")
 
-            st.info(f"💡 节能提示：曝气系统占总电耗 {e_aeration/e_total_day*100:.1f}%，采用DO变频曝气可节电15%~25%")
+            st.info(f"💡 节能提示：曝气系统占总电耗 {res['e_aeration']/res['e_total_day']*100:.1f}%，采用DO变频曝气可节电15%~25%")
 
     # 药剂成本
     with tab2:
         st.subheader("二、药剂成本核算")
         col1, col2 = st.columns(2)
         with col1:
-            naclo_daily = st.number_input("次氯酸钠日用量 (吨)", value=0.5)
-            pam_daily = st.number_input("PAM日用量 (吨)", value=0.08)
-            hcl_daily = st.number_input("盐酸日用量 (吨，pH调节)", value=0.05)
+            naclo_daily = st.number_input("次氯酸钠日用量 (吨)", value=0.5, key="cost_naclo_daily")
+            pam_daily = st.number_input("PAM日用量 (吨)", value=0.08, key="cost_pam_daily")
+            hcl_daily = st.number_input("盐酸日用量 (吨，pH调节)", value=0.05, key="cost_hcl_daily")
         with col2:
             st.info("除磷药剂、碳源用量自动读取生化计算结果")
-            if st.button("加载生化计算药剂用量"):
+            if st.button("加载生化计算药剂用量", key="cost_btn_load_med"):
                 if st.session_state.bio_result:
                     bio = st.session_state.bio_result
                     st.success(f"已加载：{bio['phos_agent_name']} {bio['phos_daily']:.3f}吨/天，{bio['carbon_agent_name']} {bio['carbon_daily']:.3f}吨/天")
                 else:
                     st.warning("请先在「生化核心计算」页完成计算")
 
-        if st.button("计算药剂总成本", type="primary"):
+        if st.button("计算药剂总成本", type="primary", key="cost_btn_med"):
             # 优先读生化结果，没有用默认
             bio = st.session_state.bio_result if st.session_state.bio_result else {}
             phos_daily = bio.get('phos_daily', 0.3)
@@ -834,36 +906,51 @@ elif page == "💰 成本经济核算":
             unit_cost = total_day / Q
 
             st.session_state.med_cost_month = total_month
+            st.session_state.med_result = {
+                'schema': RESULT_SCHEMA,
+                'phos_name': phos_name, 'carbon_name': carbon_name,
+                'phos_daily': phos_daily, 'carbon_daily': carbon_daily,
+                'naclo_daily': naclo_daily, 'pam_daily': pam_daily, 'hcl_daily': hcl_daily,
+                'cost_phos': cost_phos, 'cost_carbon': cost_carbon, 'cost_naclo': cost_naclo,
+                'cost_pam': cost_pam, 'cost_hcl': cost_hcl,
+                'total_day': total_day, 'total_month': total_month, 'unit_cost': unit_cost
+            }
 
+        # ===== 持久展示 =====
+        _stale = bool(st.session_state.get('med_result')) and st.session_state.med_result.get('schema') != RESULT_SCHEMA
+        if _stale:
+            st.info("计算结果格式已更新，请重新点击本页「计算」按钮以刷新结果。")
+        if st.session_state.get('med_result') and st.session_state.get('med_result').get('schema') == RESULT_SCHEMA:
+            res = st.session_state.med_result
             col1, col2 = st.columns(2)
             with col1:
                 med_data = pd.DataFrame({
-                    "药剂名称": [phos_name, carbon_name, "次氯酸钠(消毒)", "PAM(助凝)", "盐酸(pH调节)"],
-                    "日用量 (吨)": [phos_daily, carbon_daily, naclo_daily, pam_daily, hcl_daily],
-                    "日成本 (元)": [cost_phos, cost_carbon, cost_naclo, cost_pam, cost_hcl]
+                    "药剂名称": [res['phos_name'], res['carbon_name'], "次氯酸钠(消毒)", "PAM(助凝)", "盐酸(pH调节)"],
+                    "日用量 (吨)": [res['phos_daily'], res['carbon_daily'], res['naclo_daily'], res['pam_daily'], res['hcl_daily']],
+                    "日成本 (元)": [res['cost_phos'], res['cost_carbon'], res['cost_naclo'], res['cost_pam'], res['cost_hcl']]
                 })
                 st.dataframe(med_data, use_container_width=True, hide_index=True)
             with col2:
-                st.metric("日药剂总成本", f"{total_day:.2f} 元")
-                st.metric("月药剂总成本", f"{total_month:,.2f} 元")
-                st.metric("吨水药剂成本", f"{unit_cost:.3f} 元/m³")
+                st.metric("日药剂总成本", f"{res['total_day']:.2f} 元")
+                st.metric("月药剂总成本", f"{res['total_month']:,.2f} 元")
+                st.metric("吨水药剂成本", f"{res['unit_cost']:.3f} 元/m³")
 
     # 污泥处置成本
     with tab3:
         st.subheader("三、剩余污泥处置成本")
         col1, col2 = st.columns(2)
         with col1:
-            water_rate = st.number_input("脱水后污泥含水率 (%)", value=80) / 100
-            pam_dosage = st.number_input("吨干泥PAM投加量 (kg/t)", value=4)
+            water_rate = st.number_input("脱水后污泥含水率 (%)", value=80, key="cost_water_rate") / 100
+            pam_dosage = st.number_input("吨干泥PAM投加量 (kg/t)", value=4, key="cost_pam_dosage")
         with col2:
             st.info("污泥产量自动读取生化计算结果")
-            if st.button("加载生化计算污泥量"):
+            if st.button("加载生化计算污泥量", key="cost_btn_load_sludge"):
                 if st.session_state.bio_result:
                     st.success(f"已加载：每日干污泥 {st.session_state.bio_result['sludge_dry_daily']:.2f} kg")
                 else:
                     st.warning("请先在「生化核心计算」页完成计算")
 
-        if st.button("计算污泥处置成本", type="primary"):
+        if st.button("计算污泥处置成本", type="primary", key="cost_btn_sludge"):
             dry_daily = st.session_state.bio_result.get('sludge_dry_daily', 700)  # kg/d
             wet_daily = dry_daily / (1 - water_rate) / 1000  # 吨/天
 
@@ -877,21 +964,32 @@ elif page == "💰 成本经济核算":
             unit_cost = total_day / Q
 
             st.session_state.sludge_cost_month = total_month
+            st.session_state.sludge_result = {
+                'schema': RESULT_SCHEMA,
+                'wet_daily': wet_daily, 'cost_pam_day': cost_pam_day, 'cost_dispose_day': cost_dispose_day,
+                'total_day': total_day, 'total_month': total_month, 'unit_cost': unit_cost
+            }
 
+        # ===== 持久展示 =====
+        _stale = bool(st.session_state.get('sludge_result')) and st.session_state.sludge_result.get('schema') != RESULT_SCHEMA
+        if _stale:
+            st.info("计算结果格式已更新，请重新点击本页「计算」按钮以刷新结果。")
+        if st.session_state.get('sludge_result') and st.session_state.get('sludge_result').get('schema') == RESULT_SCHEMA:
+            res = st.session_state.sludge_result
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("每日脱水湿污泥量", f"{wet_daily:.2f} 吨")
-                st.write(f"脱水PAM日费用：{cost_pam_day:.2f} 元")
-                st.write(f"污泥外运处置费：{cost_dispose_day:.2f} 元")
+                st.metric("每日脱水湿污泥量", f"{res['wet_daily']:.2f} 吨")
+                st.write(f"脱水PAM日费用：{res['cost_pam_day']:.2f} 元")
+                st.write(f"污泥外运处置费：{res['cost_dispose_day']:.2f} 元")
             with col2:
-                st.metric("日污泥处置总成本", f"{total_day:.2f} 元")
-                st.metric("月污泥处置总成本", f"{total_month:,.2f} 元")
-                st.metric("吨水污泥处置成本", f"{unit_cost:.3f} 元/m³")
+                st.metric("日污泥处置总成本", f"{res['total_day']:.2f} 元")
+                st.metric("月污泥处置总成本", f"{res['total_month']:,.2f} 元")
+                st.metric("吨水污泥处置成本", f"{res['unit_cost']:.3f} 元/m³")
 
     # 全成本汇总
     with tab4:
         st.subheader("四、全厂全成本汇总分析")
-        if st.button("生成全成本报表", type="primary"):
+        if st.button("生成全成本报表", type="primary", key="cost_btn_total"):
             power_cost = getattr(st.session_state, 'power_cost_month', 70000)
             med_cost = getattr(st.session_state, 'med_cost_month', 120000)
             sludge_cost = getattr(st.session_state, 'sludge_cost_month', 45000)
@@ -903,11 +1001,26 @@ elif page == "💰 成本经济核算":
             Q_month = bp['Q_actual'] * 30
             unit_cost = total_month / Q_month
 
-            # 饼图（使用 Plotly 渲染为交互式 HTML/SVG，字体由客户端浏览器负责，避免服务器缺中文字体导致方块）
+            st.session_state.total_cost_result = {
+                'schema': RESULT_SCHEMA,
+                'power_cost': power_cost, 'med_cost': med_cost, 'sludge_cost': sludge_cost,
+                'staff_cost': staff_cost, 'maintain_cost': maintain_cost, 'other_cost': other_cost,
+                'total_month': total_month, 'unit_cost': unit_cost
+            }
+
+        # ===== 持久展示 =====
+        _stale = bool(st.session_state.get('total_cost_result')) and st.session_state.total_cost_result.get('schema') != RESULT_SCHEMA
+        if _stale:
+            st.info("计算结果格式已更新，请重新点击本页「计算」按钮以刷新结果。")
+        if st.session_state.get('total_cost_result') and st.session_state.get('total_cost_result').get('schema') == RESULT_SCHEMA:
+            res = st.session_state.total_cost_result
+            power_cost = res['power_cost']; med_cost = res['med_cost']; sludge_cost = res['sludge_cost']
+            staff_cost = res['staff_cost']; maintain_cost = res['maintain_cost']; other_cost = res['other_cost']
+            total_month = res['total_month']; unit_cost = res['unit_cost']
+
             labels = ["电费", "药剂费", "污泥处置", "人员工资", "维修耗材", "其他"]
             values = [power_cost, med_cost, sludge_cost, staff_cost, maintain_cost, other_cost]
             colors = ["#36a2eb", "#4bc0c0", "#ff9f40", "#ff6384", "#9966ff", "#c9cbcf"]
-            # 占比阈值：≥6% 的扇区上显示“类别+百分比”，<6% 的扇区上只显示百分比（类别靠图例查看），文本嵌入扇形内部
             total_cost = sum(values)
             slice_texts = []
             for i, v in enumerate(values):
@@ -960,7 +1073,6 @@ elif page == "💰 成本经济核算":
 
             with col2:
                 st.plotly_chart(fig, use_container_width=True)
-
 
 # ================= 页面7：报表导出 =================
 elif page == "📊 报表导出":
@@ -1022,7 +1134,7 @@ elif page == "📊 报表导出":
         all_text += "\n\n===== 生化系统计算结果 =====\n"
 
         # 2. 生化计算结果（全中文）
-        if bio:
+        if bio and bio.get('schema') == RESULT_SCHEMA:
             bio_df = pd.DataFrame({
                 "指标名称": [
                     f"{bio.get('phos_agent_name','除磷药剂')}日投加量 (吨/天)",
