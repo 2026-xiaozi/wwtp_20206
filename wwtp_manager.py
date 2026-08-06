@@ -368,21 +368,26 @@ elif page == "🧪 生化核心计算":
         }
 
         # ========== 2. 碳源投加量计算 ==========
+        cn_ratio = cod_in / tn_in
         tn_remove = tn_in - tn_out_target
         endogenous_carbon = bod_in * 0.5  # 可生化内源碳（按易降解COD≈50% BOD计，保守取值）
         need_carbon_total = tn_remove * 4  # 反硝化总需COD（C/N=4，含安全余量；理论最小约2.86 gCOD/gNO3-N）
-        carbon_deficit = max(0, need_carbon_total - endogenous_carbon)
-        # 两级缺氧碳源分配 7:3，并分别换算为实际药剂投加量后求和（使分配参与投加量计算）
+
+        # 状态判定与投加量统一以 C/N 阈值为准，避免"界面说无需、却仍算投加量"的矛盾：
+        # COD/TN ≥ 4 视为内碳充足，不外加碳源（缺口强制为0）；C/N < 4 才按反硝化缺口细化计算
+        if cn_ratio >= 4:
+            carbon_deficit = 0.0
+            carbon_status = f"✅ C/N比{cn_ratio:.1f}，无需补充碳源"
+        else:
+            carbon_deficit = max(0, need_carbon_total - endogenous_carbon)
+            carbon_status = f"⚠️ C/N比仅{cn_ratio:.1f}，需补充碳源"
+
+        # 两级缺氧碳源分配 7:3（求和后相互抵消，对总投加量无影响，仅内部拆分）
         carbon_anox1 = carbon_deficit * 0.7
         carbon_anox2 = carbon_deficit * 0.3
         carbon_cfg = carbon_agent_config[carbon_agent_type]
-        carbon_dosage = (carbon_anox1 + carbon_anox2) / carbon_cfg["cod_eq"]  # mg/L，两级之和
+        carbon_dosage = (carbon_anox1 + carbon_anox2) / carbon_cfg["cod_eq"]  # mg/L
         carbon_daily = carbon_dosage * Q / 1000 / 1000  # 吨/天
-        cn_ratio = cod_in / tn_in
-        if cn_ratio < 4:
-            carbon_status = f"⚠️ C/N比仅{cn_ratio:.1f}，需补充碳源"
-        else:
-            carbon_status = f"✅ C/N比{cn_ratio:.1f}，无需补充碳源"
 
         # ========== 碳磷比计算与判定 ==========
         cp_ratio = bod_in / tp_in
