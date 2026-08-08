@@ -3,7 +3,34 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
+import os
 from io import BytesIO
+
+# 可选：若项目根目录存在 .env，则自动加载其中的环境变量（如 OPENAI_API_KEY）
+# 显式按脚本所在目录查找 .env，避免「从上级目录启动 streamlit」时找不到。
+# 优先用 python-dotenv；未安装或失败时，用标准库兜底解析，确保任意环境都能生效。
+def _load_env_from_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception:
+        pass
+
+dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(dotenv_path):
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path)
+    except Exception:
+        _load_env_from_file(dotenv_path)
 
 # ================= 页面基础配置 =================
 st.set_page_config(
@@ -12,18 +39,147 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# 兼容旧会话：如果侧边栏 LLM 状态已缓存，先清除，避免修改 .env 后仍显示旧状态
+for _k in ["_llm_status"]:
+    st.session_state.pop(_k, None)
+
+
+# ================= 全局视觉样式（高端统一主题） =================
+GLOBAL_CSS = r"""
+<style>
+:root{
+  --bg1:#eef4f9; --bg2:#e1ebf3;
+  --surface:#ffffff;
+  --primary:#0e7490; --primary2:#0891b2; --accent:#14b8a6;
+  --text:#0f172a; --text2:#475569; --muted:#94a3b8;
+  --line:#e6edf3;
+  --ok:#059669; --warn:#d97706; --err:#dc2626;
+  --radius:14px;
+  --shadow:0 6px 24px rgba(15,23,42,0.08);
+}
+html, body, .stApp{
+  font-family:'Microsoft YaHei','PingFang SC','Hiragino Sans GB',-apple-system,'Segoe UI',Roboto,sans-serif;
+}
+.stApp{ background:linear-gradient(135deg,var(--bg1) 0%,var(--bg2) 100%) !important; }
+#MainMenu, footer{ display:none !important; }
+header[data-testid="stHeader"]{ display:none !important; }
+.main .block-container{ padding-top:2.2rem; padding-bottom:3rem; }
+
+/* 标题体系 */
+h1{ font-size:1.7rem; font-weight:700; color:var(--text);
+    border-left:5px solid var(--primary); padding-left:14px; margin-bottom:.6rem; }
+h2{ font-size:1.28rem; font-weight:650; color:var(--text); }
+h3{ font-size:1.05rem; font-weight:600; color:var(--text); }
+.stCaption{ color:var(--text2) !important; }
+.stMarkdown p{ color:var(--text2); }
+
+/* 侧边栏：深蓝渐变 + 白字 */
+[data-testid="stSidebar"]{
+  background:linear-gradient(180deg,#0f3043 0%,#0a2233 100%);
+  border-right:1px solid rgba(255,255,255,0.08);
+}
+[data-testid="stSidebar"] *{ color:#cbd5e1; }
+[data-testid="stSidebar"] .css-1oe5cao, [data-testid="stSidebar"] h1{ color:#fff !important; }
+[data-testid="stSidebar"] hr{ border-color:rgba(255,255,255,0.12) !important; }
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"]{
+  gap:6px;
+}
+[data-testid="stSidebar"] [role="radio"]{
+  padding:10px 14px; border-radius:9px; transition:.15s;
+}
+[data-testid="stSidebar"] [aria-checked="true"]{
+  background:rgba(20,184,166,0.18) !important;
+  color:#ffffff !important; font-weight:700;
+}
+
+/* 指标卡片 */
+[data-testid="stMetric"]{
+  background:var(--surface); border:1px solid var(--line);
+  border-radius:var(--radius); padding:16px 18px; box-shadow:var(--shadow);
+}
+[data-testid="stMetricLabel"]{ color:var(--text2) !important; font-size:.9rem; }
+[data-testid="stMetricValue"]{ color:var(--primary) !important; font-size:1.6rem; font-weight:700; }
+
+/* 数据表 */
+[data-testid="stDataFrame"]{
+  border-radius:var(--radius); overflow:hidden; box-shadow:var(--shadow);
+  border:1px solid var(--line);
+}
+[data-testid="stDataFrame"] table th{
+  background:#0e7490 !important; color:#fff !important;
+  font-weight:600; text-align:center;
+}
+[data-testid="stDataFrame"] table td{ text-align:center; }
+
+/* 选项卡 */
+[data-baseweb="tab"]{ font-weight:600; color:var(--text2); }
+[aria-selected="true"]{ color:var(--primary) !important; border-bottom:2px solid var(--primary) !important; }
+
+/* 按钮 */
+.stButton>button{
+  border-radius:10px; border:none; font-weight:600;
+  background:linear-gradient(135deg,var(--primary),var(--primary2)); color:#fff;
+  box-shadow:0 2px 10px rgba(14,116,144,0.30); transition:.2s; padding:.5rem 1rem;
+}
+.stButton>button:hover{ transform:translateY(-1px); box-shadow:0 6px 18px rgba(14,116,144,0.35); }
+
+/* 提示框 */
+.stAlert{ border-radius:12px !important; box-shadow:var(--shadow); }
+</style>
+"""
+st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
+
 # ================= 密码登录校验（新增部分） =================
 # 初始化登录状态
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 
 # 未登录时显示登录页
+
 if not st.session_state.logged_in:
-    st.markdown("<h2 style='text-align:center; margin-top:15%'>🔒 系统登录</h2>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1, 2, 1])
+    # —— 登录页专属样式：仅登录页隐藏侧边栏/顶栏，并美化表单 ——
+    st.markdown(r"""
+    <style>
+    [data-testid="stSidebar"]{ display:none !important; }
+    header[data-testid="stHeader"]{ display:none !important; }
+    #login-scope ~ .element-container [data-testid="stTextInput"]{ max-width:320px; margin:0 auto; }
+    #login-scope ~ .element-container [data-testid="stButton"]{ max-width:320px; margin:14px auto 0; }
+    #login-scope ~ .element-container [data-testid="stTextInput"] input{
+        border-radius:10px; border:1.5px solid #cbd5e1; padding:11px 14px; font-size:1rem;
+    }
+    #login-scope ~ .element-container [data-testid="stTextInput"] input:focus{
+        border-color:#0e7490; box-shadow:0 0 0 3px rgba(14,116,144,0.15);
+    }
+    .login-card{ max-width:480px; margin:6vh auto 2vh; text-align:center;
+        background:rgba(255,255,255,0.92); backdrop-filter:blur(8px);
+        border:1px solid rgba(255,255,255,0.6); border-radius:20px;
+        padding:40px 34px; box-shadow:0 24px 60px rgba(15,23,42,0.20); }
+    .login-logo{ width:74px;height:74px;border-radius:50%;margin:0 auto 18px;
+        display:flex;align-items:center;justify-content:center;font-size:34px;
+        background:linear-gradient(135deg,#0e7490,#14b8a6);
+        box-shadow:0 10px 26px rgba(14,116,144,0.35); }
+    .login-title{ font-size:1.55rem;font-weight:800;color:#0f3043;line-height:1.45; }
+    .login-en{ margin-top:10px;font-size:.72rem;letter-spacing:2px;color:#64748b;
+        text-transform:uppercase; }
+    .login-divider{ width:64px;height:3px;border-radius:2px;margin:20px auto;
+        background:linear-gradient(90deg,#0e7490,#14b8a6); }
+    .login-tip{ color:#475569;font-size:.95rem; }
+    </style>
+    <div id="login-scope"></div>
+    <div class="login-card">
+        <div class="login-logo">💧</div>
+        <div class="login-title">五段Bardenpho污水厂<br>智能运维管理系统</div>
+        <div class="login-en">Five-Stage Bardenpho WWTP O&amp;M Platform</div>
+        <div class="login-divider"></div>
+        <div class="login-tip">请输入访问密码以进入系统</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 1.6, 1])
     with col2:
-        input_pwd = st.text_input("请输入访问密码", type="password")
-        if st.button("登录系统", type="primary", use_container_width=True):
+        input_pwd = st.text_input("访问密码", type="password",
+                                  placeholder="请输入访问密码", help="默认密码：123456")
+        if st.button("登 录 系 统", type="primary", use_container_width=True):
             # 从平台后台读取正确密码（本地无 secrets.toml 时自动回退默认密码）
             try:
                 correct_pwd = st.secrets["access_password"]
@@ -37,6 +193,7 @@ if not st.session_state.logged_in:
                 st.error("密码错误，请重试")
     st.stop()  # 密码验证不通过，停止执行后面所有代码
 
+
 # matplotlib中文显示：设置跨平台中文字体回退栈，覆盖 Windows/macOS/Linux 及常见服务器环境
 plt.rcParams["font.sans-serif"] = [
     "Microsoft YaHei", "SimHei", "SimSun", "DengXian",
@@ -48,7 +205,26 @@ plt.rcParams["axes.unicode_minus"] = False
 
 # 计算结果 schema 版本号：用于识别 session_state 中残留的旧版计算结果。
 # 代码更新后，旧 dict 可能缺少新字段（如 bio['R']），据此安全提示重算而非崩溃。
-RESULT_SCHEMA = "2026-08-06"
+RESULT_SCHEMA = "2026-08-08"
+
+
+def _judge_hrt(value, low, high, tol=0.20):
+    """HRT 双边界判定：严格在 [low, high] 内为合理；在 ±tol 容差内为临界；否则偏离。"""
+    if low <= value <= high:
+        return "✅ 合理"
+    eff_low, eff_high = low * (1 - tol), high * (1 + tol)
+    if eff_low <= value <= eff_high:
+        return "⚠️ 临界"
+    return "⚠️ 偏离"
+
+
+def _judge_hrt_min(value, low, tol=0.10):
+    """HRT 单下界判定：≥low 为满足；在 -tol 容差内为临界；否则偏短。"""
+    if value >= low:
+        return "✅ 满足"
+    if value >= low * (1 - tol):
+        return "⚠️ 临界"
+    return "⚠️ 偏短"
 
 
 # ================= 全局参数初始化 =================
@@ -100,6 +276,49 @@ if 'base_params' not in st.session_state:
 if 'bio_result' not in st.session_state:
     st.session_state.bio_result = {}
 
+# ============================================================
+# AI 能力模块（预测 / 优化 / 诊断 / 认知）—— 感知·预测·优化·决策·认知 闭环
+# 说明：核心算法与 LLM 调用已抽到 wwtp_core.py（无 Streamlit 依赖，可单测）；
+#      LLM 助手在无 API Key 时自动降级为规则引擎，保证演示永不中断。
+# ============================================================
+import os
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SAMPLE_CSV = os.path.join(SCRIPT_DIR, "sample_wwtp_history.csv")
+
+# 核心函数从 wwtp_core 导入（wwtp_core.py 须与本文件同目录）
+import sys as _sys
+_sys.path.insert(0, SCRIPT_DIR)
+from wwtp_core import (
+    holt_winters_forecast, _harmonic_forecast, _snaive_drift, _backtest,
+    smart_forecast, optimize_dosing, diagnose_process, find_kb_dir,
+    retrieve_kb, _rule_reply, ai_assistant_stream, check_llm_config,
+    validate_base_params, mechanism_advice, influent_surge_note, _norm_cdf,
+)
+
+# 跨页数据契约访问器（item 7）：统一校验 RESULT_SCHEMA，避免散落的 .get('schema') 判断
+def get_compute_result(name):
+    """返回 schema 匹配的 result dict，否则 None。集中 RESULT_SCHEMA 校验。"""
+    r = st.session_state.get(name)
+    if isinstance(r, dict) and r.get("schema") == RESULT_SCHEMA:
+        return r
+    return None
+
+
+def num_input(label, value=None, *args, **kwargs):
+    """包装 st.number_input：自动对齐 min_value / max_value 与 value 的类型，
+    避免 StreamlitMixedNumericTypesError（value 为 int 而 min_value 为 float 等）。"""
+    numeric_keys = ("min_value", "max_value", "step")
+    if value is not None:
+        for key in numeric_keys:
+            if key in kwargs and kwargs[key] is not None:
+                cur = kwargs[key]
+                if isinstance(value, int) and not isinstance(cur, int):
+                    kwargs[key] = int(cur)
+                elif isinstance(value, float) and not isinstance(cur, float):
+                    kwargs[key] = float(cur)
+    return st.number_input(label, value=value, *args, **kwargs)
+
+
 # ================= 侧边栏导航 =================
 with st.sidebar:
     st.title("🏭 系统导航")
@@ -114,6 +333,9 @@ with st.sidebar:
             "🏞️ 二沉池专项校核",
             "⚙️ 工况调节建议",
             "💰 成本经济核算",
+            "🔮 AI 预测预警",
+            "🛠️ AI 工艺优化与诊断",
+            "💬 AI 工艺助手",
             "📊 报表导出"
         ]
     )
@@ -121,6 +343,12 @@ with st.sidebar:
     st.caption("工艺路线：厌氧→缺氧1→好氧1→缺氧2→好氧2→二沉池")
     st.caption("内回流：好氧1 → 缺氧1；好氧1自流至缺氧2深度反硝化")
     st.caption("好氧2功能：吹脱氮气 + 防止二沉池反硝化")
+    st.markdown("---")
+    if "_llm_status" not in st.session_state:
+        st.session_state._llm_status = check_llm_config()
+    _mode, _detail, _ok = st.session_state._llm_status
+    _icon = {"offline": "🟢", "local": "🔵", "cloud": "🟣"}.get(_mode, "⚪")
+    st.markdown(f"{_icon} **AI 模式**：{_detail}")
 
 
 # ================= 页面1：基础参数设置 =================
@@ -132,56 +360,57 @@ if page == "📝 基础参数设置":
 
     with col1:
         st.subheader("一、水量与池体参数")
-        Q_design = st.number_input("设计日处理水量 (m³/d)", value=st.session_state.base_params['Q_design'])
-        Q_actual = st.number_input("实际日均进水量 (m³/d)", value=st.session_state.base_params['Q_actual'])
-        Kz = st.number_input("总变化系数 Kz", value=st.session_state.base_params['Kz'])
-        Q_max = st.number_input("最大时流量 (m³/h)", value=st.session_state.base_params['Q_max'])
+        Q_design = num_input("设计日处理水量 (m³/d)", value=st.session_state.base_params['Q_design'], min_value=0.0)
+        Q_actual = num_input("实际日均进水量 (m³/d)", value=st.session_state.base_params['Q_actual'], min_value=0.0)
+        Kz = num_input("总变化系数 Kz", value=st.session_state.base_params['Kz'], min_value=0.0)
+        Q_max = num_input("最大时流量 (m³/h)", value=st.session_state.base_params['Q_max'], min_value=0.0)
 
         st.markdown("#### 各池有效容积 (m³)")
-        V_ana = st.number_input("厌氧池", value=st.session_state.base_params['V_ana'])
-        V_anox1 = st.number_input("第一缺氧池", value=st.session_state.base_params['V_anox1'])
-        V_aero1 = st.number_input("第一好氧池", value=st.session_state.base_params['V_aero1'])
-        V_anox2 = st.number_input("第二缺氧池", value=st.session_state.base_params['V_anox2'])
-        V_aero2 = st.number_input("第二好氧池", value=st.session_state.base_params['V_aero2'])
-        V_total = st.number_input("生化池总容积", value=st.session_state.base_params['V_total'])
-        settler_area = st.number_input("二沉池总表面积 (m²)", value=st.session_state.base_params['settler_area'])
-        settler_depth = st.number_input("二沉池有效水深 (m)", value=st.session_state.base_params['settler_depth'])
+        V_ana = num_input("厌氧池", value=st.session_state.base_params['V_ana'], min_value=0.0)
+        V_anox1 = num_input("第一缺氧池", value=st.session_state.base_params['V_anox1'], min_value=0.0)
+        V_aero1 = num_input("第一好氧池", value=st.session_state.base_params['V_aero1'], min_value=0.0)
+        V_anox2 = num_input("第二缺氧池", value=st.session_state.base_params['V_anox2'], min_value=0.0)
+        V_aero2 = num_input("第二好氧池", value=st.session_state.base_params['V_aero2'], min_value=0.0)
+        V_total = num_input("生化池总容积", value=st.session_state.base_params['V_total'], min_value=0.0)
+        settler_area = num_input("二沉池总表面积 (m²)", value=st.session_state.base_params['settler_area'], min_value=0.0)
+        settler_depth = num_input("二沉池有效水深 (m)", value=st.session_state.base_params['settler_depth'], min_value=0.0)
 
     with col2:
         st.subheader("二、生化动力学系数")
-        Y = st.number_input("污泥产率系数 Y", value=st.session_state.base_params['Y'])
-        Kd = st.number_input("内源衰减系数 Kd (d⁻¹)", value=st.session_state.base_params['Kd'])
-        nitr_rate = st.number_input("硝化速率 kgNH3/(kgMLSS·d)", value=st.session_state.base_params['nitr_rate'])
-        denitr_rate = st.number_input("反硝化速率 kgNO3/(kgMLSS·d)", value=st.session_state.base_params['denitr_rate'])
-        mlvss_mlss = st.number_input("MLVSS / MLSS 比值", value=st.session_state.base_params['mlvss_mlss'])
-        carbon_cod_eq = st.number_input("碳源COD当量基准值 (gCOD/g药剂)",
-                                        value=st.session_state.base_params['carbon_cod_eq'])
+        Y = num_input("污泥产率系数 Y", value=st.session_state.base_params['Y'], min_value=0.0)
+        Kd = num_input("内源衰减系数 Kd (d⁻¹)", value=st.session_state.base_params['Kd'], min_value=0.0)
+        nitr_rate = num_input("硝化速率 kgNH3/(kgMLSS·d)", value=st.session_state.base_params['nitr_rate'], min_value=0.0)
+        denitr_rate = num_input("反硝化速率 kgNO3/(kgMLSS·d)", value=st.session_state.base_params['denitr_rate'], min_value=0.0)
+        mlvss_mlss = num_input("MLVSS / MLSS 比值", value=st.session_state.base_params['mlvss_mlss'], min_value=0.0)
+        carbon_cod_eq = num_input("碳源COD当量基准值 (gCOD/g药剂)",
+                                        value=st.session_state.base_params['carbon_cod_eq'], min_value=0.0)
 
         st.subheader("三、经济成本参数")
-        elec_price = st.number_input("电价 (元/kWh)", value=st.session_state.base_params['elec_price'])
+        elec_price = num_input("电价 (元/kWh)", value=st.session_state.base_params['elec_price'], min_value=0.0)
         # 除磷药剂双价格
-        pac_price = st.number_input("PAC铝盐单价 (元/吨)", value=st.session_state.base_params['pac_price'])
-        pfs_price = st.number_input("PFS铁盐单价 (元/吨)", value=st.session_state.base_params['pfs_price'])
+        pac_price = num_input("PAC铝盐单价 (元/吨)", value=st.session_state.base_params['pac_price'], min_value=0.0)
+        pfs_price = num_input("PFS铁盐单价 (元/吨)", value=st.session_state.base_params['pfs_price'], min_value=0.0)
         # 四类碳源单价
-        naac_price = st.number_input("乙酸钠碳源单价 (元/吨)", value=st.session_state.base_params['naac_price'])
-        methanol_price = st.number_input("甲醇碳源单价 (元/吨)", value=st.session_state.base_params['methanol_price'])
-        glucose_price = st.number_input("葡萄糖碳源单价 (元/吨)", value=st.session_state.base_params['glucose_price'])
-        composite_carbon_price = st.number_input("复合碳源单价 (元/吨)",
-                                                 value=st.session_state.base_params['composite_carbon_price'])
+        naac_price = num_input("乙酸钠碳源单价 (元/吨)", value=st.session_state.base_params['naac_price'], min_value=0.0)
+        methanol_price = num_input("甲醇碳源单价 (元/吨)", value=st.session_state.base_params['methanol_price'], min_value=0.0)
+        glucose_price = num_input("葡萄糖碳源单价 (元/吨)", value=st.session_state.base_params['glucose_price'], min_value=0.0)
+        composite_carbon_price = num_input("复合碳源单价 (元/吨)",
+                                                 value=st.session_state.base_params['composite_carbon_price'], min_value=0.0)
         # 其他药剂
-        naclo_price = st.number_input("次氯酸钠单价 (元/吨)", value=st.session_state.base_params['naclo_price'])
-        pam_price = st.number_input("PAM絮凝剂单价 (元/吨)", value=st.session_state.base_params['pam_price'])
-        hcl_price = st.number_input("盐酸单价 (元/吨，pH调节)", value=st.session_state.base_params['hcl_price'])
+        naclo_price = num_input("次氯酸钠单价 (元/吨)", value=st.session_state.base_params['naclo_price'], min_value=0.0)
+        pam_price = num_input("PAM絮凝剂单价 (元/吨)", value=st.session_state.base_params['pam_price'], min_value=0.0)
+        hcl_price = num_input("盐酸单价 (元/吨，pH调节)", value=st.session_state.base_params['hcl_price'], min_value=0.0)
         # 污泥&人工运维
-        sludge_dispose_price = st.number_input("污泥处置单价 (元/吨湿泥)",
-                                               value=st.session_state.base_params['sludge_dispose_price'])
-        staff_num = st.number_input("运维人员数量 (人)", value=st.session_state.base_params['staff_num'])
-        staff_salary = st.number_input("人均月工资 (元)", value=st.session_state.base_params['staff_salary'])
-        maintain_cost = st.number_input("月度设备维修费 (元)", value=st.session_state.base_params['maintain_cost'])
-        other_cost = st.number_input("月度其他杂费 (元)", value=st.session_state.base_params['other_cost'])
+        sludge_dispose_price = num_input("污泥处置单价 (元/吨湿泥)",
+                                               value=st.session_state.base_params['sludge_dispose_price'], min_value=0.0)
+        staff_num = num_input("运维人员数量 (人)", value=st.session_state.base_params['staff_num'], min_value=0.0)
+        staff_salary = num_input("人均月工资 (元)", value=st.session_state.base_params['staff_salary'], min_value=0.0)
+        maintain_cost = num_input("月度设备维修费 (元)", value=st.session_state.base_params['maintain_cost'], min_value=0.0)
+        other_cost = num_input("月度其他杂费 (元)", value=st.session_state.base_params['other_cost'], min_value=0.0)
 
     if st.button("💾 保存全部基础参数", type="primary", use_container_width=True):
-        st.session_state.base_params.update({
+        # item 8：保存前校验——先组装待保存参数，校验通过才写入，避免脏数据导致后续计算除零/NaN
+        candidate = {
             'Q_design': Q_design, 'Q_actual': Q_actual, 'Kz': Kz, 'Q_max': Q_max,
             'V_ana': V_ana, 'V_anox1': V_anox1, 'V_aero1': V_aero1,
             'V_anox2': V_anox2, 'V_aero2': V_aero2, 'V_total': V_total,
@@ -203,9 +432,18 @@ if page == "📝 基础参数设置":
             'hcl_price': hcl_price,
             'sludge_dispose_price': sludge_dispose_price,
             'staff_num': staff_num, 'staff_salary': staff_salary,
-            'maintain_cost': maintain_cost, 'other_cost': other_cost
-        })
-        st.success("✅ 所有基础参数已保存，全部计算模块将自动调用")
+            'maintain_cost': maintain_cost, 'other_cost': other_cost,
+        }
+        errors, warnings = validate_base_params(candidate)
+        for w in warnings:
+            st.warning("⚠️ " + w)
+        if errors:
+            for e in errors:
+                st.error("⛔ " + e)
+            st.error("存在致命参数错误，已取消保存，请修正后重试。")
+        else:
+            st.session_state.base_params.update(candidate)
+            st.success("✅ 所有基础参数已保存，全部计算模块将自动调用")
 
 
 # ================= 页面2：水力与负荷校核 =================
@@ -215,12 +453,12 @@ elif page == "💧 水力与负荷校核":
 
     st.subheader("一、进水水质与运行参数")
     col1, col2, col3, col4, col5, col6 = st.columns(6)
-    with col1: cod_in = st.number_input("进水COD (mg/L)", value=350)
-    with col2: bod_in = st.number_input("进水BOD5 (mg/L)", value=180)
-    with col3: tn_in = st.number_input("进水总氮 TN (mg/L)", value=40)
-    with col4: nh3_in = st.number_input("进水氨氮 NH3-N (mg/L)", value=28)
-    with col5: tp_in = st.number_input("进水总磷 TP (mg/L)", value=5)
-    with col6: mlss = st.number_input("MLSS (mg/L)", value=3500)
+    with col1: cod_in = num_input("进水COD (mg/L)", value=350)
+    with col2: bod_in = num_input("进水BOD5 (mg/L)", value=180)
+    with col3: tn_in = num_input("进水总氮 TN (mg/L)", value=40)
+    with col4: nh3_in = num_input("进水氨氮 NH3-N (mg/L)", value=28)
+    with col5: tp_in = num_input("进水总磷 TP (mg/L)", value=5)
+    with col6: mlss = num_input("MLSS (mg/L)", value=3500)
 
     if st.button("开始校核计算", type="primary"):
         Q = bp['Q_actual']
@@ -235,13 +473,13 @@ elif page == "💧 水力与负荷校核":
         hrt_aero2 = bp['V_aero2'] / Q * 24
         hrt_aero_total = V_aero_total / Q * 24
 
-        # HRT判定
-        hrt_total_status = "✅ 满足" if hrt_total >= 12 else "⚠️ 偏短"
-        hrt_ana_status = "✅ 合理" if 1 <= hrt_ana <= 2 else "⚠️ 偏离"
-        hrt_anox1_status = "✅ 合理" if 2 <= hrt_anox1 <= 4 else "⚠️ 偏离"
-        hrt_aero1_status = "✅ 合理" if 4 <= hrt_aero1 <= 12 else "⚠️ 偏离"
-        hrt_anox2_status = "✅ 合理" if 2 <= hrt_anox2 <= 4 else "⚠️ 偏离"
-        hrt_aero2_status = "✅ 合理" if 0.5 <= hrt_aero2 <= 2 else "⚠️ 偏离"
+        # HRT判定（采用±20%容差：严格在范围内为合理，边界附近为临界，否则为偏离）
+        hrt_total_status = _judge_hrt_min(hrt_total, 12, tol=0.10)
+        hrt_ana_status = _judge_hrt(hrt_ana, 0.5, 2, tol=0.20)
+        hrt_anox1_status = _judge_hrt(hrt_anox1, 2, 4, tol=0.20)
+        hrt_aero1_status = _judge_hrt(hrt_aero1, 4, 12, tol=0.20)
+        hrt_anox2_status = _judge_hrt(hrt_anox2, 2, 4, tol=0.20)
+        hrt_aero2_status = _judge_hrt(hrt_aero2, 0.5, 2, tol=0.20)
 
 
         # ========== 3. 污泥负荷 ==========
@@ -324,21 +562,21 @@ elif page == "🧪 生化核心计算":
     st.subheader("一、运行参数输入")
     col1, col2, col3 = st.columns(3)
     with col1:
-        cod_in = st.number_input("进水COD (mg/L)", value=350)
-        bod_in = st.number_input("进水BOD5 (mg/L)", value=180)
-        nh3_in = st.number_input("进水氨氮 (mg/L)", value=28)
-        tn_in = st.number_input("进水总氮 TN (mg/L)", value=40)
-        tp_in = st.number_input("进水总磷 TP (mg/L)", value=5)
+        cod_in = num_input("进水COD (mg/L)", value=350)
+        bod_in = num_input("进水BOD5 (mg/L)", value=180)
+        nh3_in = num_input("进水氨氮 (mg/L)", value=28)
+        tn_in = num_input("进水总氮 TN (mg/L)", value=40)
+        tp_in = num_input("进水总磷 TP (mg/L)", value=5)
     with col2:
-        tn_out_target = st.number_input("出水TN目标 (mg/L)", value=15)
-        tp_out_target = st.number_input("出水TP目标 (mg/L)", value=0.5)
-        bod_eff = st.number_input("实际出水BOD5 (mg/L)", value=10)
-        cod_eff = st.number_input("实际出水COD (mg/L)", value=50)
-        nh3_eff = st.number_input("实际出水氨氮 (mg/L)", value=1.5)
-        mlss = st.number_input("MLSS 混合液浓度 (mg/L)", value=3500)
-        R = st.number_input("污泥回流比 R (%)", value=100) / 100
-        R1 = st.number_input("内回流比 R1 (好氧1→缺氧1, %)", value=200) / 100
-        waste_sludge_volume = st.number_input("每日外排剩余污泥量(m³/d)", value=20.0)
+        tn_out_target = num_input("出水TN目标 (mg/L)", value=15)
+        tp_out_target = num_input("出水TP目标 (mg/L)", value=0.5)
+        bod_eff = num_input("实际出水BOD5 (mg/L)", value=10)
+        cod_eff = num_input("实际出水COD (mg/L)", value=50)
+        nh3_eff = num_input("实际出水氨氮 (mg/L)", value=1.5)
+        mlss = num_input("MLSS 混合液浓度 (mg/L)", value=3500)
+        R = num_input("污泥回流比 R (%)", value=100) / 100
+        R1 = num_input("内回流比 R1 (好氧1→缺氧1, %)", value=200) / 100
+        waste_sludge_volume = num_input("每日外排剩余污泥量(m³/d)", value=20.0)
 
     with col3:
         phos_agent_type = st.selectbox("除磷药剂类型", ["聚合氯化铝 PAC（铝盐）", "聚合硫酸铁 PFS（铁盐）"])
@@ -485,6 +723,7 @@ elif page == "🧪 生化核心计算":
             # —— 以下为界面持久化展示所需的派生值 ——
             'R': R, 'R1': R1, 'total_return': total_return,
             'min_R1': min_R1, 'tn_status': tn_status,
+            'tn_out_target': tn_out_target, 'tp_out_target': tp_out_target,
             'carbon_agent_type': carbon_agent_type, 'cn_ratio': cn_ratio,
             'carbon_status': carbon_status, 'cp_ratio': cp_ratio,
             'cp_need_carbon': cp_need_carbon, 'cp_status': cp_status,
@@ -588,13 +827,13 @@ elif page == "🏞️ 二沉池专项校核":
 
     col1, col2 = st.columns(2)
     with col1:
-        mlss = st.number_input("MLSS 混合液浓度 (mg/L)", value=3500)
-        R = st.number_input("污泥回流比 R (%)", value=100) / 100
-        sv30 = st.number_input("SV30 沉降比 (%)", value=25)
+        mlss = num_input("MLSS 混合液浓度 (mg/L)", value=3500)
+        R = num_input("污泥回流比 R (%)", value=100) / 100
+        sv30 = num_input("SV30 沉降比 (%)", value=25)
     with col2:
-        Q_max = st.number_input("最大时流量 (m³/h)", value=bp['Q_max'])
-        area = st.number_input("二沉池总表面积 (m²)", value=bp['settler_area'])
-        depth = st.number_input("二沉池有效水深 (m)", value=bp['settler_depth'])
+        Q_max = num_input("最大时流量 (m³/h)", value=bp['Q_max'])
+        area = num_input("二沉池总表面积 (m²)", value=bp['settler_area'])
+        depth = num_input("二沉池有效水深 (m)", value=bp['settler_depth'])
 
     if st.button("开始校核", type="primary"):
         # 计算
@@ -808,15 +1047,15 @@ elif page == "💰 成本经济核算":
         st.subheader("一、全厂电耗成本核算")
         col1, col2 = st.columns(2)
         with col1:
-            aeration_kw = st.number_input("曝气风机总功率 (kW)", value=220, key="cost_aeration_kw")
-            backflow_kw = st.number_input("污泥回流泵总功率 (kW)", value=30, key="cost_backflow_kw")
-            internal_kw = st.number_input("内回流泵总功率 (kW)", value=45, key="cost_internal_kw")
-            mix_kw = st.number_input("搅拌/推流器总功率 (kW)", value=25, key="cost_mix_kw")
+            aeration_kw = num_input("曝气风机总功率 (kW)", value=220, key="cost_aeration_kw")
+            backflow_kw = num_input("污泥回流泵总功率 (kW)", value=30, key="cost_backflow_kw")
+            internal_kw = num_input("内回流泵总功率 (kW)", value=45, key="cost_internal_kw")
+            mix_kw = num_input("搅拌/推流器总功率 (kW)", value=25, key="cost_mix_kw")
         with col2:
-            pump_kw = st.number_input("进水泵房总功率 (kW)", value=55, key="cost_pump_kw")
-            dewater_kw = st.number_input("污泥脱水系统功率 (kW)", value=37, key="cost_dewater_kw")
-            dewater_h = st.number_input("脱水系统日运行时长 (h)", value=8, key="cost_dewater_h")
-            other_kw = st.number_input("辅助设备总功率 (kW)", value=20, key="cost_other_kw")
+            pump_kw = num_input("进水泵房总功率 (kW)", value=55, key="cost_pump_kw")
+            dewater_kw = num_input("污泥脱水系统功率 (kW)", value=37, key="cost_dewater_kw")
+            dewater_h = num_input("脱水系统日运行时长 (h)", value=8, key="cost_dewater_h")
+            other_kw = num_input("辅助设备总功率 (kW)", value=20, key="cost_other_kw")
 
         if st.button("计算电耗成本", type="primary", key="cost_btn_power"):
             # 日电耗
@@ -872,9 +1111,9 @@ elif page == "💰 成本经济核算":
         st.subheader("二、药剂成本核算")
         col1, col2 = st.columns(2)
         with col1:
-            naclo_daily = st.number_input("次氯酸钠日用量 (吨)", value=0.5, key="cost_naclo_daily")
-            pam_daily = st.number_input("PAM日用量 (吨)", value=0.08, key="cost_pam_daily")
-            hcl_daily = st.number_input("盐酸日用量 (吨，pH调节)", value=0.05, key="cost_hcl_daily")
+            naclo_daily = num_input("次氯酸钠日用量 (吨)", value=0.5, key="cost_naclo_daily")
+            pam_daily = num_input("PAM日用量 (吨)", value=0.08, key="cost_pam_daily")
+            hcl_daily = num_input("盐酸日用量 (吨，pH调节)", value=0.05, key="cost_hcl_daily")
         with col2:
             st.info("除磷药剂、碳源用量自动读取生化计算结果")
             if st.button("加载生化计算药剂用量", key="cost_btn_load_med"):
@@ -940,8 +1179,8 @@ elif page == "💰 成本经济核算":
         st.subheader("三、剩余污泥处置成本")
         col1, col2 = st.columns(2)
         with col1:
-            water_rate = st.number_input("脱水后污泥含水率 (%)", value=80, key="cost_water_rate") / 100
-            pam_dosage = st.number_input("吨干泥PAM投加量 (kg/t)", value=4, key="cost_pam_dosage")
+            water_rate = num_input("脱水后污泥含水率 (%)", value=80, key="cost_water_rate") / 100
+            pam_dosage = num_input("吨干泥PAM投加量 (kg/t)", value=4, key="cost_pam_dosage")
         with col2:
             st.info("污泥产量自动读取生化计算结果")
             if st.button("加载生化计算污泥量", key="cost_btn_load_sludge"):
@@ -1119,7 +1358,7 @@ elif page == "📊 报表导出":
 
     if st.button("生成并下载报表", type="primary", use_container_width=True):
         bp = st.session_state.base_params
-        bio = st.session_state.bio_result
+        bio = get_compute_result("bio_result")
 
         all_text = ""
         # 1. 水厂基础参数（中文化）
@@ -1134,7 +1373,7 @@ elif page == "📊 报表导出":
         all_text += "\n\n===== 生化系统计算结果 =====\n"
 
         # 2. 生化计算结果（全中文）
-        if bio and bio.get('schema') == RESULT_SCHEMA:
+        if bio:
             bio_df = pd.DataFrame({
                 "指标名称": [
                     f"{bio.get('phos_agent_name','除磷药剂')}日投加量 (吨/天)",
@@ -1188,3 +1427,215 @@ elif page == "📊 报表导出":
             mime="text/csv",
             use_container_width=True
         )
+
+# ================= 页面8：AI 预测预警 =================
+elif page == "🔮 AI 预测预警":
+    st.header("🔮 进水负荷与出水水质 AI 预测预警")
+    st.caption("多模型集成预测：Holt-Winters + 谐波回归 + 季节朴素，经历史回测逆误差自动加权选优；"
+               "纯算法无需联网。默认载入内置合成测试数据。")
+
+    if not os.path.exists(SAMPLE_CSV):
+        st.error("未找到示例数据 sample_wwtp_history.csv，请先运行 gen_sample_data.py 生成")
+    else:
+        df = pd.read_csv(SAMPLE_CSV)
+        df["时间"] = pd.to_datetime(df["时间"])
+        df = df.set_index("时间").sort_index()
+        var_options = {
+            "出水COD(mg/L)": 50, "出水NH3-N(mg/L)": 5, "出水TN(mg/L)": 15,
+            "出水TP(mg/L)": 0.5, "进水流量(m3/h)": None, "进水COD(mg/L)": None,
+            "进水TN(mg/L)": None, "进水TP(mg/L)": None,
+        }
+        with st.expander("⚙️ 高级设置", expanded=False):
+            season = num_input("季节周期（小时，默认日周期=24）", min_value=1, max_value=168,
+                                     value=24, step=1,
+                                     help="数据呈现的周期性长度；小时级数据通常取 24（日周期）")
+        col1, col2 = st.columns(2)
+        with col1:
+            var = st.selectbox("预测指标", list(var_options.keys()))
+        with col2:
+            horizon = st.selectbox("预测步长（小时）", [24, 48, 168], index=0)
+        if st.button("运行预测", type="primary", key="predict_btn"):
+            with st.spinner("正在多模型回测与集成预测…"):
+                series = df[var].dropna().to_numpy(dtype=float)
+                res = smart_forecast(series, season=int(season), h=int(horizon))
+            st.session_state.predict_result = {
+                "schema": RESULT_SCHEMA, "var": var, "horizon": int(horizon),
+                "res": res, "std": var_options[var], "season": int(season),
+            }
+        if st.session_state.get("predict_result", {}).get("schema") == RESULT_SCHEMA:
+            pr = st.session_state.predict_result
+            res = pr["res"]; var = pr["var"]; std = pr["std"]
+            s = res["series"]; fc = res["forecast"]; lo = res["lower"]; up = res["upper"]
+            idx_hist = df.index
+            last = idx_hist[-1]
+            idx_fc = pd.date_range(last + pd.Timedelta(hours=1), periods=len(fc), freq="h")
+
+            # ---- 指标卡 ----
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("预测均值", f"{fc.mean():.2f}")
+            c2.metric("预测峰值", f"{fc.max():.2f}")
+            n_warn = int((up > std).sum()) if std is not None else 0
+            c3.metric("超标风险时点", f"{n_warn}/{len(fc)}" if std is not None else "—")
+            c4.metric("历史异常点", f"{len(res['anomalies'])}")
+
+            # ---- 主预测图 ----
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=idx_hist[-7 * 24:], y=s[-7 * 24:],
+                                     name="历史(近7天)", line=dict(color="#0E7490")))
+            fig.add_trace(go.Scatter(x=idx_fc, y=up, line=dict(width=0), showlegend=False))
+            fig.add_trace(go.Scatter(x=idx_fc, y=lo, line=dict(width=0), fill="tonexty",
+                                     fillcolor="rgba(20,184,166,0.22)", name="95%置信区间"))
+            fig.add_trace(go.Scatter(x=idx_fc, y=fc, name="AI集成预测",
+                                     line=dict(color="#F59E0B", dash="dot", width=2)))
+            if std is not None:
+                fig.add_hline(y=std, line=dict(color="#DC2626", dash="dash"),
+                              annotation_text=f"标准限值 {std}")
+            fig.update_layout(title=dict(text=f"{var} 未来 {pr['horizon']} 小时 AI 预测", x=0.5, xanchor="center"),
+                              xaxis_title="时间", yaxis_title=var, template="plotly_white",
+                              legend=dict(orientation="h"))
+            st.plotly_chart(fig, use_container_width=True)
+
+            # ---- 预警（概率化 + 机理联动，item 10）----
+            if std is not None:
+                # 基于残差σ的正态近似，估算整体达标风险概率（纯 numpy，无需 scipy）
+                z = (std - fc) / max(res["sigma"], 1e-9)
+                risk_pct = float(np.clip(1 - _norm_cdf(z), 0, 1).mean()) * 100
+                if n_warn > 0 or risk_pct > 5:
+                    bio = get_compute_result("bio_result")
+                    st.error(f"⚠️ 预测区间上限有 {n_warn}/{len(fc)} 个时点超过标准限值 {std} mg/L；"
+                             f"按历史波动估计，整体达标风险概率约 **{risk_pct:.0f}%**。建议提前调控。")
+                    advice = mechanism_advice(var, bio)
+                    if advice:
+                        st.info("🔧 机理联动建议：" + advice)
+                else:
+                    st.success(f"✅ 预测期内出水 {var} 预计均低于标准限值 {std} mg/L"
+                               f"（达标风险概率约 {risk_pct:.0f}%）")
+            else:
+                st.info("该指标无强制排放标准，仅作负荷趋势预测")
+            # 进水负荷冲击的机理联动提示（跨变量，与预测指标无关）
+            surge = influent_surge_note(var, s, res["forecast"], season=int(pr["season"]))
+            if surge:
+                st.warning("📈 " + surge)
+
+            # ---- 模型回测对比 ----
+            if res["metrics"]:
+                st.subheader("📊 模型回测精度（留一法，尾部验证集）")
+                mt = res["metrics"]
+                rows = []
+                for name in mt:
+                    rows.append({
+                        "模型": name,
+                        "集成权重": f"{res['weights'].get(name, 0) * 100:.0f}%",
+                        "RMSE": f"{mt[name]['RMSE']:.3f}",
+                        "MAE": f"{mt[name]['MAE']:.3f}",
+                        "MAPE(%)": f"{mt[name]['MAPE(%)']:.1f}",
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.caption("系统按回测 RMSE 逆误差加权自动集成三个模型：权重越高代表该模型在历史验证集上越可靠。")
+
+            # ---- 时序分解 ----
+            st.subheader("🔍 时序分解（趋势 / 季节 / 残差）")
+            fig2 = go.Figure()
+            trend = res["trend"]
+            fig2.add_trace(go.Scatter(x=idx_hist[-14 * 24:], y=trend[-14 * 24:], name="趋势",
+                                      line=dict(color="#7C3AED")))
+            fig2.add_trace(go.Scatter(x=idx_hist, y=res["seasonal"], name="季节分量",
+                                      line=dict(color="#0891B2", width=1)))
+            fig2.update_layout(title=dict(text="趋势与季节分量（近14天）", x=0.5, xanchor="center"),
+                               xaxis_title="时间", yaxis_title=var, template="plotly_white",
+                               legend=dict(orientation="h"))
+            st.plotly_chart(fig2, use_container_width=True)
+
+            fig3 = go.Figure()
+            resid = res["resid"]
+            fig3.add_trace(go.Scatter(x=idx_hist, y=resid, name="残差",
+                                      line=dict(color="#64748B", width=1)))
+            if len(res["anomalies"]):
+                an = res["anomalies"]
+                fig3.add_trace(go.Scatter(x=idx_hist[an], y=resid[an], mode="markers",
+                                          name="异常点(|残差|>3σ)",
+                                          marker=dict(color="#DC2626", size=6, symbol="x")))
+            fig3.add_hline(y=0, line=dict(color="#94A3B8", width=1))
+            fig3.update_layout(title=dict(text="残差与异常检测", x=0.5, xanchor="center"),
+                               xaxis_title="时间", yaxis_title="残差", template="plotly_white",
+                               legend=dict(orientation="h"))
+            st.plotly_chart(fig3, use_container_width=True)
+            st.caption("异常点表示历史运行中显著偏离模型预期的时刻（如进水冲击、设备异常），可作为运行复盘重点。")
+
+# ================= 页面9：AI 工艺优化与诊断 =================
+elif page == "🛠️ AI 工艺优化与诊断":
+    st.header("🛠️ 智能加药优化 与 异常诊断")
+    st.caption("基于线性规划在满足出水标准下最小化药剂成本；超标时给出可解释根因排序")
+
+    bio = get_compute_result("bio_result")
+    if not bio:
+        st.warning("⚠️ 请先在「🧪 生化核心计算」页面完成计算，本页将读取其结果进行优化与诊断。")
+    else:
+        bp = st.session_state.base_params
+        st.subheader("一、智能加药优化（最小成本方案）")
+        if st.button("一键优化投加方案", type="primary", key="opt_btn"):
+            st.session_state.opt_result = optimize_dosing(bp, bio)
+        if "opt_result" in st.session_state:
+            opt = st.session_state.opt_result
+            st.write(f"当前碳源缺口 {opt['carbon_deficit']:.1f} mg/L（COD），化学除磷需求 {opt['tp_need_chem']:.2f} mg/L（P）")
+            rows = []
+            for name, dose in opt["rec_carbon"].items():
+                if dose > 0:
+                    rows.append([f"碳源·{name}", f"{dose:.3f} 吨/天"])
+            for name, dose in opt["rec_phos"].items():
+                if dose > 0:
+                    rows.append([f"除磷剂·{name}", f"{dose:.3f} 吨/天"])
+            if not rows:
+                rows = [["无需外加药剂", "0 吨/天（当前已达标）"]]
+            st.table(pd.DataFrame(rows, columns=["药剂", "推荐日投加量"]))
+            c1, c2, c3 = st.columns(3)
+            c1.metric("当前药剂日成本(元)", f"{opt['cur_cost']:.0f}")
+            c2.metric("优化后药剂日成本(元)", f"{opt['opt_cost']:.0f}")
+            c3.metric("预计可节约", f"{opt['saving']:.0f} 元/天 ({opt['saving_pct']:.1f}%)")
+            if opt["saving_pct"] > 1:
+                st.success(f"✅ 在满足出水标准前提下，优化方案预计每日节省约 {opt['saving']:.0f} 元药剂费。")
+            else:
+                st.info("当前投加方案已接近成本最优。")
+
+        st.subheader("二、异常诊断（可解释根因排序）")
+        issues = diagnose_process(bp, bio)
+        if not issues:
+            st.success("✅ 未检出明显异常，当前工艺参数处于合理区间。")
+        else:
+            for title, causes in issues:
+                with st.expander(f"⚠️ {title}", expanded=True):
+                    for cause, advice, w in sorted(causes, key=lambda x: -x[2]):
+                        st.markdown(f"- **可能原因（置信度 {w * 100:.0f}%）**：{cause}\n\n  → 处置建议：{advice}")
+
+# ================= 页面10：AI 工艺助手 =================
+elif page == "💬 AI 工艺助手":
+    st.header("💬 AI 工艺助手（自然语言交互）")
+    st.caption("注入当前系统计算结果与知识库作为上下文；侧边栏显示「云端/本地模型已配置」时由大模型实时生成回答，"
+               "否则自动降级为内置规则引擎。当前模式见左侧「AI 模式」状态条。")
+
+    ctx_parts = []
+    bp = st.session_state.get("base_params", {})
+    bio = get_compute_result("bio_result")
+    if bp:
+        ctx_parts.append("【基础参数】设计水量 {} m3/d，实际水量 {} m3/d，电价 {} 元/kWh".format(
+            bp.get('Q_design'), bp.get('Q_actual'), bp.get('elec_price')))
+    if bio:
+        ctx_parts.append("【生化结果】理论出水TN {:.2f} mg/L，碳源缺口 {:.1f} mg/L，化学除磷需求 {:.2f} mg/L，SRT {:.1f} d，C/N {:.1f}".format(
+            bio.get('tn_theory', 0), bio.get('carbon_deficit', 0), bio.get('tp_need_chem', 0),
+            bio.get('srt', 0), bio.get('cn_ratio', 0)))
+    ctx = "\n".join(ctx_parts) if ctx_parts else "（尚无可用的计算结果，请先在相关页面完成计算）"
+
+    if "ai_messages" not in st.session_state:
+        st.session_state.ai_messages = []
+    for m in st.session_state.ai_messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+    if q := st.chat_input("向工艺助手提问，如：当前总氮偏高怎么处理？"):
+        st.session_state.ai_messages.append({"role": "user", "content": q})
+        with st.chat_message("user"):
+            st.markdown(q)
+        with st.chat_message("assistant"):
+            reply = st.write_stream(ai_assistant_stream(q, ctx, kb_dir=find_kb_dir()))
+        st.session_state.ai_messages.append({"role": "assistant", "content": reply})
+    if st.button("清空对话", key="ai_clear"):
+        st.session_state.ai_messages = []
