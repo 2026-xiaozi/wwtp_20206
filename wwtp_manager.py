@@ -477,16 +477,35 @@ def _rule_reply(q, ctx):
 
 
 # ============================================================
+# LLM 配置读取（st.secrets / 环境变量 / .env 兜底）
+# ============================================================
+def _get_llm_config():
+    """读取 LLM 配置，优先级：st.secrets > 环境变量 > 默认值。
+    支持 Streamlit Cloud（secrets.toml）与本地的 .env / os.environ 多种部署方式。"""
+    key = base = model = None
+    if st is not None:
+        key = st.secrets.get("OPENAI_API_KEY") or st.secrets.get("WWTP_LLM_KEY") or None
+        base = st.secrets.get("OPENAI_BASE_URL") or None
+        model = st.secrets.get("OPENAI_MODEL") or None
+    if not key:
+        key = os.environ.get("OPENAI_API_KEY") or os.environ.get("WWTP_LLM_KEY")
+    if not base:
+        base = os.environ.get("OPENAI_BASE_URL")
+    if not model:
+        model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    return key, base, model
+
+
+# ============================================================
 # LLM 助手（流式，无 Key 时降级规则引擎）
 # ============================================================
 def ai_assistant_stream(user_q, ctx, kb_dir=None):
     """LLM 工艺助手（流式）：有 Key 时调用大模型逐字输出（支持 RAG），否则降级规则引擎一次性返回。"""
     try:
-        key = os.environ.get("OPENAI_API_KEY") or os.environ.get("WWTP_LLM_KEY")
+        key, base, model = _get_llm_config()
         if key:
             from openai import OpenAI
-            base = os.environ.get("OPENAI_BASE_URL")
-            model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
             client = OpenAI(api_key=key, base_url=base) if base else OpenAI(api_key=key)
             kb = retrieve_kb(user_q, kb_dir) if kb_dir else []
             sys_p = ("你是污水处理厂工艺工程师智能助手，仅依据提供的运行计算结果与知识库作答，"
@@ -516,10 +535,8 @@ def ai_assistant_stream(user_q, ctx, kb_dir=None):
 def check_llm_config():
     """启动时自检 LLM 配置，返回 (mode, detail, ok)。
     mode: offline(离线规则引擎) / local(本地自托管) / cloud(云端) / unknown。
-    该函数仅用标准库，无 Streamlit 依赖，便于离线测试。"""
-    key = os.environ.get("OPENAI_API_KEY") or os.environ.get("WWTP_LLM_KEY")
-    base = os.environ.get("OPENAI_BASE_URL")
-    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    支持 st.secrets、环境变量与 .env 文件三种来源。"""
+    key, base, model = _get_llm_config()
     if not key and not base:
         return ("offline", "未配置 Key/BaseURL，AI 助手以「离线规则引擎」运行（无需联网/Key，任意网络可用）", True)
     if base and ("localhost" in base or "127.0.0.1" in base or "0.0.0.0" in base):
@@ -587,6 +604,71 @@ def influent_surge_note(var, series, forecast, season=24):
                 f"易形成冲击负荷：建议提前预留调节池缓冲、适当提高污泥浓度(MLSS)与内回流 R1，"
                 f"防止出水水质波动与二沉池跑泥。")
     return None
+
+
+def _build_sample_df(hours=24*60, seed=20260808):
+    """生成 AI 预测页使用的合成演示数据（与 gen_sample_data.py 等价）。
+    部署时若 sample_wwtp_history.csv 缺失，可即时在内存生成，无需额外文件。"""
+    if pd is None:
+        raise RuntimeError("需要 pandas 才能生成示例数据")
+    rng = np.random.default_rng(seed)
+    start = pd.Timestamp("2026-06-01 00:00")
+    t = pd.date_range(start, periods=hours, freq="h")
+    hour = t.hour.to_numpy()
+    dow = t.dayofweek.to_numpy()
+    day_idx = np.arange(hours)
+
+    diurnal = 0.5 * np.sin(2 * np.pi * (hour - 4) / 24) + 0.5 * np.sin(2 * np.pi * (hour - 16) / 24)
+    diurnal = (diurnal - diurnal.min()) / (diurnal.max() - diurnal.min())
+    week_factor = np.where(dow >= 5, 0.88, 1.0)
+    trend = 1.0 + 0.08 * np.sin(2 * np.pi * day_idx / (24 * 30))
+
+    base_flow = 420.0
+    flow = base_flow * (0.55 + 0.55 * diurnal) * week_factor * trend
+    flow *= (1 + rng.normal(0, 0.05, hours))
+    flow = np.clip(flow, 200, 900)
+
+    def polluant(base, cv, spike_prob, spike_mul):
+        val = base * (1 + rng.normal(0, cv, hours))
+        spike = rng.random(hours) < spike_prob
+        val[spike] *= rng.uniform(spike_mul, spike_mul + 0.6, spike.sum())
+        return np.clip(val, base * 0.3, None)
+
+    cod_in = polluant(350, 0.10, 0.04, 1.4)
+    nh3_in = polluant(28, 0.10, 0.03, 1.3)
+    tn_in = nh3_in + polluant(13, 0.10, 0.02, 1.2)
+    tp_in = polluant(5.0, 0.12, 0.03, 1.4)
+
+    def effluent(inf, removal, std, occasional):
+        out = inf * (1 - removal) + rng.normal(0, std, hours)
+        hit = (inf > np.percentile(inf, 92)) & (rng.random(hours) < occasional)
+        out[hit] = out[hit] * rng.uniform(1.3, 1.8, hit.sum())
+        return np.clip(out, 0.05, None)
+
+    cod_out = effluent(cod_in, 0.90, 2.5, 0.5)
+    nh3_out = effluent(nh3_in, 0.965, 0.3, 0.4)
+    tn_out = effluent(tn_in, 0.70, 1.0, 0.5)
+    tp_out = effluent(tp_in, 0.93, 0.05, 0.4)
+
+    energy = 760 + 0.45 * flow + rng.normal(0, 35, hours)
+    energy = np.clip(energy, 400, None)
+    chem = 18 + 0.02 * flow + 6 * (tp_out > 0.45) + rng.normal(0, 2.5, hours)
+    chem = np.clip(chem, 5, None)
+
+    return pd.DataFrame({
+        "时间": t.strftime("%Y-%m-%d %H:%M"),
+        "进水流量(m3/h)": np.round(flow, 1),
+        "进水COD(mg/L)": np.round(cod_in, 1),
+        "进水NH3-N(mg/L)": np.round(nh3_in, 1),
+        "进水TN(mg/L)": np.round(tn_in, 1),
+        "进水TP(mg/L)": np.round(tp_in, 2),
+        "出水COD(mg/L)": np.round(cod_out, 1),
+        "出水NH3-N(mg/L)": np.round(nh3_out, 2),
+        "出水TN(mg/L)": np.round(tn_out, 2),
+        "出水TP(mg/L)": np.round(tp_out, 3),
+        "电耗(kWh/h)": np.round(energy, 1),
+        "药耗(kg/h)": np.round(chem, 1),
+    })
 
 
 if st is not None:
@@ -1981,7 +2063,12 @@ if st is not None:
                    "纯算法无需联网。默认载入内置合成测试数据。")
 
         if not os.path.exists(SAMPLE_CSV):
-            st.error("未找到示例数据 sample_wwtp_history.csv，请先运行 gen_sample_data.py 生成")
+            st.info("⚙️ 未找到本地示例数据，正在即时生成合成演示数据…")
+            df = _build_sample_df()
+            try:
+                df.to_csv(SAMPLE_CSV, index=False, encoding="utf-8-sig")
+            except Exception:
+                pass
         else:
             df = pd.read_csv(SAMPLE_CSV)
             df["时间"] = pd.to_datetime(df["时间"])
