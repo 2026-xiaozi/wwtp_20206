@@ -17,6 +17,11 @@ try:
     import plotly.graph_objects as go
 except ImportError:
     go = None
+try:
+    import reportlab
+    HAS_REPORTLAB = True
+except ImportError:
+    HAS_REPORTLAB = False
 from io import BytesIO
 
 # 可选：若项目根目录存在 .env，则自动加载其中的环境变量（如 OPENAI_API_KEY）
@@ -680,6 +685,11 @@ def export_pdf_report(bp, bio, cost):
     因此生成的 PDF 自带中文字形，在 Windows / macOS / Linux / Android / iOS 上都不会出现方块。
     纯函数：不依赖 Streamlit，便于测试。
     """
+    if not HAS_REPORTLAB:
+        raise ModuleNotFoundError(
+            "reportlab 未安装。请在 requirements.txt 中添加 'reportlab==4.2.2' 并重新部署，"
+            "或在当前环境执行：pip install reportlab==4.2.2"
+        )
     import io
     from datetime import datetime
     from reportlab.lib.pagesizes import A4
@@ -2248,6 +2258,16 @@ if st is not None:
             "other_cost": "月度其他杂费 (元)"
         }
 
+        if not HAS_REPORTLAB:
+            st.warning(
+                "⚠️ 当前部署环境缺少 `reportlab` 库，PDF 导出暂时不可用。\n\n"
+                "**修复方法（二选一）：**\n"
+                "1. **Streamlit Cloud 部署**：确认 GitHub 仓库的 `requirements.txt` 包含 `reportlab==4.2.2`，"
+                "然后在 Streamlit Cloud 管理后台点击 『Reboot app』或 『Manage app → Reboot』刷新依赖。\n"
+                "2. **本地运行**：执行 `pip install reportlab==4.2.2` 后重启 Streamlit。\n\n"
+                "下方可先下载 CSV 版报表作为临时替代。"
+            )
+
         if st.button("生成并下载 PDF 报表", type="primary", use_container_width=True):
             bp = st.session_state.base_params
             bio = get_compute_result("bio_result")
@@ -2262,6 +2282,10 @@ if st is not None:
                     mime="application/pdf",
                     use_container_width=True
                 )
+            except ModuleNotFoundError as e:
+                st.error(f"⚠️ PDF 生成失败：{e}\n\n"
+                         f"**请检查**：GitHub 上的 `requirements.txt` 是否已写入 `reportlab==4.2.2`，"
+                         f"并在 Streamlit Cloud 后台点击 Reboot 刷新环境。")
             except Exception as e:
                 st.error(f"⚠️ PDF 生成失败：{e}（请确认已安装依赖 reportlab：pip install reportlab）")
 
