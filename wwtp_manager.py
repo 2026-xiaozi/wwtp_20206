@@ -671,6 +671,270 @@ def _build_sample_df(hours=24*60, seed=20260808):
     })
 
 
+def export_pdf_report(bp, bio, cost):
+    """生成排版精美的中文 PDF 运行报表，返回 BytesIO。
+
+    中文字体嵌入策略（确保电脑/手机均可正确显示）：
+      1. 优先使用系统无衬线 CJK 字体（Windows 微软雅黑/黑体、macOS PingFang、Linux Noto/WQY）；
+      2. 找不到时回退到 reportlab 内置 STSong-Light（宋体 CID，免字体文件）。
+    因此生成的 PDF 自带中文字形，在 Windows / macOS / Linux / Android / iOS 上都不会出现方块。
+    纯函数：不依赖 Streamlit，便于测试。
+    """
+    import io
+    from datetime import datetime
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                    TableStyle, PageBreak)
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics.charts.piecharts import Pie
+    from reportlab.graphics.charts.legends import Legend
+
+    # ---------- 中文字体 ----------
+    cjk = "STSong-Light"
+    _ttf = [
+        r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    ]
+    for fp in _ttf:
+        if os.path.exists(fp):
+            try:
+                pdfmetrics.registerFont(TTFont("CJK", fp, subfontIndex=0))
+                cjk = "CJK"
+                break
+            except Exception:
+                continue
+    if cjk == "STSong-Light":
+        try:
+            pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+        except Exception:
+            pass
+
+    # ---------- 样式 ----------
+    NAVY = colors.HexColor("#0b3d63")
+    LIGHT = colors.HexColor("#eef4f8")
+    GRID = colors.HexColor("#bcccd9")
+
+    def _table_style():
+        return TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, -1), cjk),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("GRID", (0, 0), (-1, -1), 0.5, GRID),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT]),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ])
+
+    ss = getSampleStyleSheet()
+    st_title = ParagraphStyle("t", parent=ss["Title"], fontName=cjk, fontSize=20,
+                              leading=26, textColor=NAVY, alignment=TA_CENTER)
+    st_sub = ParagraphStyle("sub", parent=ss["BodyText"], fontName=cjk, fontSize=10.5,
+                            leading=15, textColor=colors.HexColor("#444444"), alignment=TA_CENTER)
+    st_h = ParagraphStyle("h", parent=ss["Heading1"], fontName=cjk, fontSize=14,
+                          leading=18, textColor=NAVY, spaceBefore=12, spaceAfter=6)
+    st_body = ParagraphStyle("b", parent=ss["BodyText"], fontName=cjk, fontSize=9.5, leading=14)
+    st_small = ParagraphStyle("s", parent=ss["BodyText"], fontName=cjk, fontSize=8,
+                              leading=11, textColor=colors.HexColor("#666666"))
+    st_cell = ParagraphStyle("c", parent=ss["BodyText"], fontName=cjk, fontSize=9, leading=12)
+    st_cellw = ParagraphStyle("cw", parent=st_cell, textColor=colors.white)
+    st_bullet = ParagraphStyle("bl", parent=ss["BodyText"], fontName=cjk, fontSize=9.5,
+                               leading=15, leftIndent=10)
+
+    def fmt(v):
+        if isinstance(v, float):
+            return f"{v:,.2f}"
+        if isinstance(v, int):
+            return f"{v:,}"
+        return str(v)
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=18 * mm, bottomMargin=16 * mm,
+                            leftMargin=16 * mm, rightMargin=16 * mm,
+                            title="五段Bardenpho污水厂运行报表")
+    flow = []
+
+    # ---------- 封面 ----------
+    flow.append(Paragraph("五段 Bardenpho 污水处理厂", st_title))
+    flow.append(Paragraph("运行计算报表", st_title))
+    flow.append(Spacer(1, 4))
+    flow.append(Paragraph("工艺校核 · 生化计算 · 成本分析 · AI 辅助决策", st_sub))
+    flow.append(Spacer(1, 6))
+    flow.append(Paragraph(f"报表生成时间：{datetime.now():%Y-%m-%d %H:%M}", st_small))
+    flow.append(Spacer(1, 10))
+
+    if cost:
+        tn_txt = f"<b>{bio['tn_theory']:.2f}</b><br/>理论出水 TN (mg/L)" if bio else "—"
+        kpi = [[
+            Paragraph(f"<b>{cost['total_month']:,.0f}</b><br/>月度总成本 (元)", st_cell),
+            Paragraph(f"<b>{cost['unit_cost']:.3f}</b><br/>吨水综合成本 (元/吨)", st_cell),
+            Paragraph(tn_txt, st_cell),
+        ]]
+        kt = Table(kpi, colWidths=[58 * mm] * 3)
+        kt.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), LIGHT),
+            ("BOX", (0, 0), (-1, -1), 0.5, GRID),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, GRID),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        flow.append(kt)
+        flow.append(Spacer(1, 6))
+
+    # ---------- 一、基础参数 ----------
+    param_map = {
+        "Q_design": "设计日处理水量 (m³/d)", "Q_actual": "实际日均进水量 (m³/d)",
+        "Kz": "总变化系数 Kz", "Q_max": "最大时流量 (m³/h)",
+        "V_ana": "厌氧池有效容积 (m³)", "V_anox1": "第一缺氧池有效容积 (m³)",
+        "V_aero1": "第一好氧池有效容积 (m³)", "V_anox2": "第二缺氧池有效容积 (m³)",
+        "V_aero2": "第二好氧池有效容积 (m³)", "V_total": "生化池总容积 (m³)",
+        "settler_area": "二沉池总表面积 (m²)", "settler_depth": "二沉池有效水深 (m)",
+        "Y": "污泥产率系数 Y", "Kd": "内源衰减系数 Kd (d⁻¹)",
+        "nitr_rate": "硝化速率 (kgNH3/(kgMLSS·d))", "denitr_rate": "反硝化速率 (kgNO3/(kgMLSS·d))",
+        "mlvss_mlss": "MLVSS/MLSS 比值", "elec_price": "电价 (元/kWh)",
+        "pac_price": "PAC单价 (元/吨)", "pfs_price": "PFS单价 (元/吨)",
+        "naac_price": "乙酸钠单价 (元/吨)", "methanol_price": "甲醇单价 (元/吨)",
+        "glucose_price": "葡萄糖单价 (元/吨)", "composite_carbon_price": "复合碳源单价 (元/吨)",
+        "naclo_price": "次氯酸钠单价 (元/吨)", "pam_price": "PAM单价 (元/吨)",
+        "hcl_price": "盐酸单价 (元/吨)", "sludge_dispose_price": "污泥处置单价 (元/吨湿泥)",
+        "staff_num": "运维人员数量 (人)", "staff_salary": "人均月工资 (元)",
+        "maintain_cost": "月度设备维修费 (元)", "other_cost": "月度其他杂费 (元)",
+    }
+    flow.append(Paragraph("一、水厂基础设计参数", st_h))
+    rows = [[Paragraph("参数名称", st_cellw), Paragraph("参数值", st_cellw)]]
+    for k, v in bp.items():
+        rows.append([Paragraph(param_map.get(k, k), st_cell), Paragraph(fmt(v), st_cell)])
+    t = Table(rows, colWidths=[120 * mm, 58 * mm], repeatRows=1)
+    t.setStyle(_table_style())
+    flow.append(t)
+    flow.append(PageBreak())
+
+    # ---------- 二、生化结果 ----------
+    flow.append(Paragraph("二、生化系统计算结果", st_h))
+    if bio:
+        bio_rows = [
+            ("理论出水总氮 TN", f"{bio['tn_theory']:.2f} mg/L", bio.get('tn_status', '')),
+            ("达标所需最小内回流 R1", f"{max(bio['min_R1'], 100):.1f} %", ""),
+            ("进水碳氮比 C/N", f"{bio['cn_ratio']:.2f}", bio.get('carbon_status', '')),
+            ("碳源缺口", f"{bio['carbon_deficit']:.1f} mg/L (COD)", ""),
+            (f"{bio['carbon_agent_name']}日投加量", f"{bio['carbon_daily']:.3f} 吨/天", ""),
+            ("需化学除磷量（P）", f"{bio['tp_need_chem']:.2f} mg/L", ""),
+            (f"{bio['phos_agent_name']}日投加量", f"{bio['phos_daily']:.3f} 吨/天", ""),
+            ("污泥龄 SRT（硝化段）", f"{bio['srt']:.1f} d", "满足硝化菌世代要求" if bio['srt'] > 10 else "泥龄偏短，硝化菌易流失"),
+            ("每日剩余干污泥量", f"{bio['sludge_dry_daily']:.2f} kg/d", ""),
+            ("湿污泥量（含水率99.2%）", f"{bio['sludge_wet_daily']:.2f} m³/d", ""),
+        ]
+        r2 = [[Paragraph("指标", st_cellw), Paragraph("计算结果", st_cellw), Paragraph("说明 / 状态", st_cellw)]]
+        for a, b, c in bio_rows:
+            r2.append([Paragraph(a, st_cell), Paragraph(b, st_cell), Paragraph(c, st_cell)])
+        t2 = Table(r2, colWidths=[60 * mm, 50 * mm, 68 * mm], repeatRows=1)
+        t2.setStyle(_table_style())
+        flow.append(t2)
+    else:
+        flow.append(Paragraph("暂无生化计算数据，请先完成「生化核心计算」页面。", st_body))
+    flow.append(PageBreak())
+
+    # ---------- 三、成本 + 饼图 ----------
+    flow.append(Paragraph("三、月度运行成本核算", st_h))
+    if cost:
+        labels = ["电费", "药剂费", "污泥处置", "人员工资", "维修耗材", "其他"]
+        vals = [cost['power_cost'], cost['med_cost'], cost['sludge_cost'],
+                cost['staff_cost'], cost['maintain_cost'], cost['other_cost']]
+        tt = sum(vals)
+        palette = [colors.HexColor("#36a2eb"), colors.HexColor("#4bc0c0"),
+                   colors.HexColor("#ff9f40"), colors.HexColor("#ff6384"),
+                   colors.HexColor("#9966ff"), colors.HexColor("#c9cbcf")]
+        d = Drawing(460, 200)
+        pie = Pie()
+        pie.x, pie.y, pie.width, pie.height = 25, 30, 140, 140
+        pie.data = vals
+        pie.labels = [f"{v / tt * 100:.1f}%" if v / tt * 100 >= 5 else "" for v in vals]
+        pie.slices.fontName = cjk
+        pie.slices.fontSize = 9
+        pie.slices.strokeColor = colors.white
+        pie.slices.strokeWidth = 1
+        for i, col in enumerate(palette):
+            pie.slices[i].fillColor = col
+        d.add(pie)
+        leg = Legend()
+        leg.x, leg.y, leg.dx, leg.dy = 195, 175, 8, 9
+        leg.fontName, leg.fontSize, leg.boxAnchor, leg.columnMaximum = cjk, 8.5, "nw", 8
+        leg.colorNamePairs = [(palette[i], f"{labels[i]}  ¥{vals[i]:,.0f}  ({vals[i] / tt * 100:.1f}%)")
+                              for i in range(len(labels))]
+        d.add(leg)
+        r3 = [[Paragraph("成本类别", st_cellw), Paragraph("月度费用 (元)", st_cellw), Paragraph("占比", st_cellw)]]
+        for i in range(len(labels)):
+            r3.append([Paragraph(labels[i], st_cell), Paragraph(f"{vals[i]:,.2f}", st_cell),
+                       Paragraph(f"{vals[i] / tt * 100:.1f}%", st_cell)])
+        r3.append([Paragraph("<b>合计</b>", st_cell), Paragraph(f"<b>{tt:,.2f}</b>", st_cell), Paragraph("100%", st_cell)])
+        t3 = Table(r3, colWidths=[40 * mm, 52 * mm, 30 * mm], repeatRows=1)
+        t3.setStyle(_table_style())
+        flow.append(d)
+        flow.append(Spacer(1, 4))
+        flow.append(t3)
+        flow.append(Spacer(1, 6))
+        flow.append(Paragraph(
+            f"📌 月度运行总成本 <b>{cost['total_month']:,.2f}</b> 元，年度约 "
+            f"<b>{cost['total_month'] * 12:,.2f}</b> 元，吨水处理综合成本 "
+            f"<b>{cost['unit_cost']:.3f}</b> 元/吨。", st_body))
+    else:
+        flow.append(Paragraph("暂无成本核算数据，请先完成「成本核算」页面。", st_body))
+    flow.append(PageBreak())
+
+    # ---------- 四、结论与建议 ----------
+    flow.append(Paragraph("四、关键结论与运行建议", st_h))
+    bullets = []
+    if bio:
+        tgt = bio.get('tn_out_target', 15)
+        if bio['tn_theory'] > tgt:
+            bullets.append(f"总氮达标风险：理论出水 TN {bio['tn_theory']:.2f} mg/L 高于目标 {tgt:.1f} mg/L，"
+                           f"建议加大内回流 R1 至 ≥ {max(bio['min_R1'], 100):.0f}%。")
+        else:
+            bullets.append(f"总氮控制良好：理论出水 TN {bio['tn_theory']:.2f} mg/L 满足目标 {tgt:.1f} mg/L。")
+        if bio['carbon_deficit'] > 0:
+            bullets.append(f"碳源不足：C/N={bio['cn_ratio']:.1f} < 4，存在碳源缺口 {bio['carbon_deficit']:.1f} mg/L，"
+                           f"建议补充 {bio['carbon_agent_name']}（{bio['carbon_daily']:.3f} 吨/天）。")
+        else:
+            bullets.append(f"碳源充足：C/N={bio['cn_ratio']:.1f} ≥ 4，无需外加碳源。")
+        if bio['srt'] <= 10:
+            bullets.append(f"硝化风险：污泥龄 SRT={bio['srt']:.1f} d ≤ 10 d，硝化菌易流失，建议延长排泥周期。")
+        else:
+            bullets.append(f"硝化安全：污泥龄 SRT={bio['srt']:.1f} d，满足硝化菌世代时间要求。")
+        if bio['tp_need_chem'] > 0:
+            bullets.append(f"需化学除磷：化学除磷需求 {bio['tp_need_chem']:.2f} mg/L，"
+                           f"建议投加 {bio['phos_agent_name']}（{bio['phos_daily']:.3f} 吨/天）。")
+    else:
+        bullets.append("暂无可分析的生化结果，请先完成「生化核心计算」。")
+    bullets.append("本报告由 AI 辅助运维系统自动汇总，计算公式基于五段 Bardenpho 工艺经验模型，仅供参考，"
+                   "实际运行请以现场监测为准。")
+    for b in bullets:
+        flow.append(Paragraph(f"• {b}", st_bullet))
+
+    def _footer(canvas, doc_):
+        canvas.saveState()
+        canvas.setFont(cjk, 8)
+        canvas.setFillColor(colors.HexColor("#888888"))
+        canvas.drawString(16 * mm, 10 * mm, "五段 Bardenpho 污水厂运行报表 · AI 辅助运维系统生成")
+        canvas.drawRightString(A4[0] - 16 * mm, 10 * mm, f"第 {doc_.page} 页")
+        canvas.restoreState()
+
+    doc.build(flow, onFirstPage=_footer, onLaterPages=_footer)
+    buf.seek(0)
+    return buf
+
+
 if st is not None:
     st.set_page_config(
         page_title="五段Bardenpho污水厂运维管理系统",
@@ -1944,7 +2208,7 @@ if st is not None:
     # ================= 页面7：报表导出 =================
     elif page == "📊 报表导出":
         st.header("📊 计算报表导出")
-        st.caption("将当前所有计算结果汇总导出为中文CSV报表（Excel/WPS直接打开）")
+        st.caption("将当前所有计算结果汇总导出为排版精美的中文 PDF 报表（中文字体已嵌入，手机/电脑均可直接查看）")
 
         # 基础参数中英文映射字典（和系统界面完全对应）
         # 基础参数中英文映射字典（和系统界面完全对应，适配多碳源、铝/铁盐除磷、替换盐酸）
@@ -1984,77 +2248,22 @@ if st is not None:
             "other_cost": "月度其他杂费 (元)"
         }
 
-        if st.button("生成并下载报表", type="primary", use_container_width=True):
+        if st.button("生成并下载 PDF 报表", type="primary", use_container_width=True):
             bp = st.session_state.base_params
             bio = get_compute_result("bio_result")
-
-            all_text = ""
-            # 1. 水厂基础参数（中文化）
-            all_text += "===== 水厂基础设计参数 =====\n"
-            # 转换为中文参数名
-            chinese_params = []
-            for en_key, value in bp.items():
-                cn_name = param_name_map.get(en_key, en_key)
-                chinese_params.append({"参数名称": cn_name, "参数值": value})
-            base_df = pd.DataFrame(chinese_params)
-            all_text += base_df.to_csv(index=False, encoding="utf-8-sig")
-            all_text += "\n\n===== 生化系统计算结果 =====\n"
-
-            # 2. 生化计算结果（全中文）
-            if bio:
-                bio_df = pd.DataFrame({
-                    "指标名称": [
-                        f"{bio.get('phos_agent_name','除磷药剂')}日投加量 (吨/天)",
-                        f"{bio.get('carbon_agent_name','碳源')}日投加量 (吨/天)",
-                        "每日剩余干污泥量 (kg/d)",
-                        "湿污泥量 (m³/d，含水率99.2%)",
-                        "理论出水总氮TN (mg/L)",
-                        "污泥龄 SRT (d)"
-                    ],
-                    "计算结果": [
-                        bio['phos_daily'],
-                        bio['carbon_daily'],
-                        bio['sludge_dry_daily'],
-                        bio['sludge_wet_daily'],
-                        bio['tn_theory'],
-                        bio['srt']
-                    ]
-                })
-                all_text += bio_df.to_csv(index=False, encoding="utf-8-sig")
-            else:
-                all_text += "暂无生化计算数据，请先完成「生化核心计算」\n"
-            all_text += "\n\n===== 月度运行成本核算 =====\n"
-
-            # 3. 成本核算（全中文）
-            cost_data = {
-                "成本类别": [
-                    "月度电费",
-                    "月度药剂费",
-                    "月度污泥处置费",
-                    "月度人员工资",
-                    "月度设备维修费",
-                    "月度其他杂费"
-                ],
-                "月度金额 (元)": [
-                    getattr(st.session_state, 'power_cost_month', 0),
-                    getattr(st.session_state, 'med_cost_month', 0),
-                    getattr(st.session_state, 'sludge_cost_month', 0),
-                    bp['staff_num'] * bp['staff_salary'],
-                    bp['maintain_cost'],
-                    bp['other_cost']
-                ]
-            }
-            cost_df = pd.DataFrame(cost_data)
-            all_text += cost_df.to_csv(index=False, encoding="utf-8-sig")
-
-            st.success("✅ 中文报表生成完成，CSV文件可用Excel/WPS直接打开编辑")
-            st.download_button(
-                label="📥 下载中文CSV报表",
-                data=all_text.encode("utf-8-sig"),
-                file_name="五段Bardenpho污水厂运行报表_中文.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+            cost = get_compute_result("total_cost_result")
+            try:
+                pdf_buf = export_pdf_report(bp, bio, cost)
+                st.success("✅ PDF 报表生成完成，可直接在手机/电脑上打开查看（中文字体已嵌入）")
+                st.download_button(
+                    label="📥 下载中文PDF报表",
+                    data=pdf_buf.getvalue(),
+                    file_name="五段Bardenpho污水厂运行报表.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+            except Exception as e:
+                st.error(f"⚠️ PDF 生成失败：{e}（请确认已安装依赖 reportlab：pip install reportlab）")
 
     # ================= 页面8：AI 预测预警 =================
     elif page == "🔮 AI 预测预警":
