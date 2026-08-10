@@ -570,8 +570,9 @@ def check_llm_config():
 # 预测预警增强（item 10）—— 概率化与机理联动（纯函数，可单测）
 # ============================================================
 def _norm_cdf(x):
-    """标准正态 CDF 近似（Abramowitz-Stegun 公式），无需 scipy。"""
-    return 0.5 * (1.0 + float(np.sign(x)) * np.sqrt(1.0 - np.exp(-2.0 * x * x / np.pi)))
+    """标准正态 CDF 近似（Abramowitz-Stegun 公式），无需 scipy。支持标量或数组输入。"""
+    x = np.asarray(x, dtype=float)
+    return 0.5 * (1.0 + np.sign(x) * np.sqrt(np.clip(1.0 - np.exp(-2.0 * x * x / np.pi), 0.0, 1.0)))
 
 
 def mechanism_advice(var, bio=None):
