@@ -1,11 +1,12 @@
-# 污水厂运维管理系统 —— 依赖清单（已锁定兼容版本，便于同事/部署复现）
-# 说明：本环境经实测兼容；如你的环境已有更新版本，可酌情调整次版本号。
-streamlit==1.36.0
-pandas==2.2.2
-numpy==1.26.4
-matplotlib==3.9.0
-plotly==5.22.0
-scipy==1.13.1
-openai==1.40.0
-python-dotenv==1.0.1
-reportlab==4.2.2
+# 污水厂运维管理系统 —— 依赖清单
+# 版本放宽，兼容 Streamlit Cloud 的 Python 3.9-3.12 环境；
+# 同时避免 Python 3.13 下某些旧版本无预编译 wheel 导致部署失败。
+streamlit>=1.30.0
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+plotly>=5.15.0
+scipy>=1.10.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+reportlab>=4.0.0
