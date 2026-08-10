@@ -1,5 +1,11 @@
-streamlit>=1.30.0
-pandas
-numpy
-matplotlib
-plotly
+# 污水厂运维管理系统 —— 依赖清单（已锁定兼容版本，便于同事/部署复现）
+# 说明：本环境经实测兼容；如你的环境已有更新版本，可酌情调整次版本号。
+streamlit==1.36.0
+pandas==2.2.2
+numpy==1.26.4
+matplotlib==3.9.0
+plotly==5.22.0
+scipy==1.13.1
+openai==1.40.0
+python-dotenv==1.0.1
+reportlab==4.2.2
