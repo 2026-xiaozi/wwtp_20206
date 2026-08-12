@@ -1234,6 +1234,9 @@ if st is not None:
 
     # ================= 侧边栏导航 =================
     with st.sidebar:
+        logo_path = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
+        if os.path.exists(logo_path):
+            st.image(logo_path, width=220)
         st.title("🏭 系统导航")
         st.caption("五段Bardenpho工艺污水厂运维管理系统")
         st.markdown("---")
@@ -2365,13 +2368,22 @@ if st is not None:
                 fig.add_trace(go.Scatter(x=idx_fc, y=fc, name="AI集成预测",
                                          line=dict(color="#F59E0B", dash="dot", width=2)))
                 if std is not None:
-                    fig.add_hline(y=std, line=dict(color="#DC2626", dash="dash"),
-                                  annotation_text=f"标准限值 {std}")
+                    fig.add_hline(y=std, line=dict(color="#DC2626", dash="dash"))
+                    fig.add_annotation(
+                        x=0.99, y=std, xref="paper", yref="y",
+                        text=f"标准限值 {std}",
+                        showarrow=False,
+                        font=dict(color="#DC2626", size=13),
+                        xanchor="right", yanchor="bottom",
+                        yshift=3,
+                        bgcolor="white"
+                    )
                 fig.update_layout(title=dict(text=f"{var} 未来 {pr['horizon']} 小时 AI 预测", x=0.02, xanchor="left"),
                                   xaxis_title="时间", yaxis_title=var, template="plotly_white",
-                                  legend=dict(orientation="h", x=1.0, y=1.0,
-                                               xanchor="right", yanchor="top"),
-                                  margin=dict(b=80))
+                                  legend=dict(orientation="h", x=1.0, y=1.02,
+                                               xanchor="right", yanchor="bottom",
+                                               font=dict(color="black")),
+                                  margin=dict(t=60, b=80))
                 fig.update_xaxes(tickformat="%m月%d日", dtick=86400000.0, tickangle=-45)
                 st.plotly_chart(fig, use_container_width=True)
 
