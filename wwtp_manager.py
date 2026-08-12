@@ -489,9 +489,16 @@ def _get_llm_config():
     支持 Streamlit Cloud（secrets.toml）与本地的 .env / os.environ 多种部署方式。"""
     key = base = model = None
     if st is not None:
-        key = st.secrets.get("OPENAI_API_KEY") or st.secrets.get("WWTP_LLM_KEY") or None
-        base = st.secrets.get("OPENAI_BASE_URL") or None
-        model = st.secrets.get("OPENAI_MODEL") or None
+        try:
+            # 本地未配置 secrets.toml 时，st.secrets.get 会抛出
+            # StreamlitSecretNotFoundError（该版本未捕获"文件不存在"），
+            # 此处整体兜底，使其静默降级到环境变量 / .env。
+            s = st.secrets
+            key = s.get("OPENAI_API_KEY") or s.get("WWTP_LLM_KEY") or None
+            base = s.get("OPENAI_BASE_URL") or None
+            model = s.get("OPENAI_MODEL") or None
+        except Exception:
+            key = base = model = None
     if not key:
         key = os.environ.get("OPENAI_API_KEY") or os.environ.get("WWTP_LLM_KEY")
     if not base:
@@ -645,13 +652,16 @@ def _build_sample_df(hours=24*60, seed=20260808):
     tn_in = nh3_in + polluant(13, 0.10, 0.02, 1.2)
     tp_in = polluant(5.0, 0.12, 0.03, 1.4)
 
-    def effluent(inf, removal, std, occasional):
+    def effluent(inf, removal, std, occasional, spike_low=1.3, spike_high=1.8):
         out = inf * (1 - removal) + rng.normal(0, std, hours)
         hit = (inf > np.percentile(inf, 92)) & (rng.random(hours) < occasional)
-        out[hit] = out[hit] * rng.uniform(1.3, 1.8, hit.sum())
+        out[hit] = out[hit] * rng.uniform(spike_low, spike_high, hit.sum())
         return np.clip(out, 0.05, None)
 
-    cod_out = effluent(cod_in, 0.90, 2.5, 0.5)
+    # 出水COD：演示数据严格控制在 8–20 mg/L，不出现超标点（标准限值 30）
+    cod_out = effluent(cod_in, 0.96, 0.8, 0.0, spike_low=1.0, spike_high=1.0)
+    cod_out = np.clip(cod_out, 8.0, 20.0)
+
     nh3_out = effluent(nh3_in, 0.965, 0.3, 0.4)
     tn_out = effluent(tn_in, 0.70, 1.0, 0.5)
     tp_out = effluent(tp_in, 0.93, 0.05, 0.4)
@@ -2308,7 +2318,7 @@ if st is not None:
             df["时间"] = pd.to_datetime(df["时间"])
             df = df.set_index("时间").sort_index()
             var_options = {
-                "出水COD(mg/L)": 50, "出水NH3-N(mg/L)": 5, "出水TN(mg/L)": 15,
+                "出水COD(mg/L)": 30, "出水NH3-N(mg/L)": 5, "出水TN(mg/L)": 15,
                 "出水TP(mg/L)": 0.5, "进水流量(m3/h)": None, "进水COD(mg/L)": None,
                 "进水TN(mg/L)": None, "进水TP(mg/L)": None,
             }
@@ -2357,9 +2367,12 @@ if st is not None:
                 if std is not None:
                     fig.add_hline(y=std, line=dict(color="#DC2626", dash="dash"),
                                   annotation_text=f"标准限值 {std}")
-                fig.update_layout(title=dict(text=f"{var} 未来 {pr['horizon']} 小时 AI 预测", x=0.5, xanchor="center"),
+                fig.update_layout(title=dict(text=f"{var} 未来 {pr['horizon']} 小时 AI 预测", x=0.02, xanchor="left"),
                                   xaxis_title="时间", yaxis_title=var, template="plotly_white",
-                                  legend=dict(orientation="h"))
+                                  legend=dict(orientation="h", x=1.0, y=1.0,
+                                               xanchor="right", yanchor="top"),
+                                  margin=dict(b=80))
+                fig.update_xaxes(tickformat="%m月%d日", dtick=86400000.0, tickangle=-45)
                 st.plotly_chart(fig, use_container_width=True)
 
                 # ---- 预警（概率化 + 机理联动，item 10）----
@@ -2408,9 +2421,12 @@ if st is not None:
                                           line=dict(color="#7C3AED")))
                 fig2.add_trace(go.Scatter(x=idx_hist, y=res["seasonal"], name="季节分量",
                                           line=dict(color="#0891B2", width=1)))
-                fig2.update_layout(title=dict(text="趋势与季节分量（近14天）", x=0.5, xanchor="center"),
+                fig2.update_layout(title=dict(text="趋势与季节分量（近14天）", x=0.02, xanchor="left"),
                                    xaxis_title="时间", yaxis_title=var, template="plotly_white",
-                                   legend=dict(orientation="h"))
+                                   legend=dict(orientation="h", x=1.0, y=1.0,
+                                                xanchor="right", yanchor="top"),
+                                   margin=dict(b=80))
+                fig2.update_xaxes(tickformat="%m月%d日", dtick=86400000.0, tickangle=-45)
                 st.plotly_chart(fig2, use_container_width=True)
 
                 fig3 = go.Figure()
@@ -2423,9 +2439,12 @@ if st is not None:
                                               name="异常点(|残差|>3σ)",
                                               marker=dict(color="#DC2626", size=6, symbol="x")))
                 fig3.add_hline(y=0, line=dict(color="#94A3B8", width=1))
-                fig3.update_layout(title=dict(text="残差与异常检测", x=0.5, xanchor="center"),
+                fig3.update_layout(title=dict(text="残差与异常检测", x=0.02, xanchor="left"),
                                    xaxis_title="时间", yaxis_title="残差", template="plotly_white",
-                                   legend=dict(orientation="h"))
+                                   legend=dict(orientation="h", x=1.0, y=1.0,
+                                                xanchor="right", yanchor="top"),
+                                   margin=dict(b=80))
+                fig3.update_xaxes(tickformat="%m月%d日", dtick=86400000.0, tickangle=-45)
                 st.plotly_chart(fig3, use_container_width=True)
                 st.caption("异常点表示历史运行中显著偏离模型预期的时刻（如进水冲击、设备异常），可作为运行复盘重点。")
 
