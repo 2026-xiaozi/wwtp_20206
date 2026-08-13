@@ -997,14 +997,16 @@ if st is not None:
     .stCaption{ color:var(--text2) !important; }
     .stMarkdown p{ color:var(--text2); }
 
-    /* 侧边栏：深蓝渐变 + 白字 */
+    /* 侧边栏：天蓝色渐变 + 深字 */
     [data-testid="stSidebar"]{
-      background:linear-gradient(180deg,#0f3043 0%,#0a2233 100%);
-      border-right:1px solid rgba(255,255,255,0.08);
+      background:linear-gradient(180deg,#E3F2FD 0%,#90CAF9 100%);
+      border-right:1px solid rgba(13,71,161,0.18);
     }
-    [data-testid="stSidebar"] *{ color:#cbd5e1; }
-    [data-testid="stSidebar"] .css-1oe5cao, [data-testid="stSidebar"] h1{ color:#fff !important; }
-    [data-testid="stSidebar"] hr{ border-color:rgba(255,255,255,0.12) !important; }
+    [data-testid="stSidebar"] *{ color:#0D2A4A; }
+    [data-testid="stSidebar"] .css-1oe5cao, [data-testid="stSidebar"] h1{ color:#0B3D6E !important; }
+    [data-testid="stSidebar"] h1{ border-left:none !important; padding-left:0 !important; margin-bottom:0.85rem !important; }
+    [data-testid="stSidebar"] .stCaption, [data-testid="stSidebar"] .stMarkdown p{ color:#1A4F86 !important; }
+    [data-testid="stSidebar"] hr{ border-color:rgba(13,71,161,0.20) !important; }
     [data-testid="stSidebar"] [data-testid="stVerticalBlock"]{
       gap:6px;
     }
@@ -1012,8 +1014,9 @@ if st is not None:
       padding:10px 14px; border-radius:9px; transition:.15s;
     }
     [data-testid="stSidebar"] [aria-checked="true"]{
-      background:rgba(20,184,166,0.18) !important;
-      color:#ffffff !important; font-weight:700;
+      background:rgba(13,71,161,0.12) !important;
+      color:#0B3D6E !important; font-weight:700;
+      box-shadow:inset 0 0 0 1px rgba(13,71,161,0.35);
     }
 
     /* 指标卡片 */
