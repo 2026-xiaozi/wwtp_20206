@@ -986,7 +986,9 @@ if st is not None:
     }
     .stApp{ background:linear-gradient(135deg,var(--bg1) 0%,var(--bg2) 100%) !important; }
     #MainMenu, footer{ display:none !important; }
+    /* 隐藏顶部栏，消除顶部空白；同时隐藏侧边栏折叠按钮，使其保持展开 */
     header[data-testid="stHeader"]{ display:none !important; }
+    [data-testid="stSidebarCollapseButton"]{ display:none !important; }
     .main .block-container{ padding-top:2.2rem; padding-bottom:3rem; }
 
     /* 标题体系 */
@@ -1239,7 +1241,7 @@ if st is not None:
     with st.sidebar:
         logo_path = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
         if os.path.exists(logo_path):
-            st.image(logo_path, width=220)
+            st.image(logo_path, width=260)
         st.title("🏭 系统导航")
         st.caption("五段Bardenpho工艺污水厂运维管理系统")
         st.markdown("---")
