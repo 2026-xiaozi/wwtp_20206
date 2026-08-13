@@ -1296,7 +1296,6 @@ if st is not None:
             settler_area = num_input("二沉池总表面积 (m²)", value=st.session_state.base_params['settler_area'], min_value=0.0)
             settler_depth = num_input("二沉池有效水深 (m)", value=st.session_state.base_params['settler_depth'], min_value=0.0)
 
-        with col2:
             st.subheader("二、生化动力学系数")
             Y = num_input("污泥产率系数 Y", value=st.session_state.base_params['Y'], min_value=0.0)
             Kd = num_input("内源衰减系数 Kd (d⁻¹)", value=st.session_state.base_params['Kd'], min_value=0.0)
@@ -1306,6 +1305,7 @@ if st is not None:
             carbon_cod_eq = num_input("碳源COD当量基准值 (gCOD/g药剂)",
                                             value=st.session_state.base_params['carbon_cod_eq'], min_value=0.0)
 
+        with col2:
             st.subheader("三、经济成本参数")
             elec_price = num_input("电价 (元/kWh)", value=st.session_state.base_params['elec_price'], min_value=0.0)
             # 除磷药剂双价格
