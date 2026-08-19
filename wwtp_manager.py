@@ -2581,7 +2581,8 @@ if st is not None:
         @keyframes marquee{ 0%{transform:translateX(100%);} 100%{transform:translateX(-100%);} }
         </style>
         """, unsafe_allow_html=True)
-        st.markdown(r"""
+        _now_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.markdown(f"""
         <div class="dash-header">
           <div>
             <div class="dash-title">🛰️ 五段 Bardenpho 污水厂 · <span style="color:#38bdf8;">数字孪生驾驶舱</span></div>
@@ -2589,27 +2590,21 @@ if st is not None:
           </div>
           <div style="text-align:right;">
             <div class="dash-live"><span class="dot"></span>系统在线 LIVE</div>
-            <div class="dash-clock" id="dash-clock">--:--:--</div>
+            <div class="dash-clock">{_now_str}</div>
           </div>
         </div>
-        <script>
-        (function(){var el=document.getElementById('dash-clock');
-          function tick(){ if(el){ var d=new Date();
-            el.textContent=d.toLocaleString('zh-CN',{hour12:false}); } }
-          tick(); setInterval(tick,1000);})();
-        </script>
         """, unsafe_allow_html=True)
 
-        # 实时微波动：自动刷新 + 平滑抖动（幅度 <1%，仅影响展示，不写 CSV）
+        # 实时微波动：自动刷新 + 平滑抖动（幅度 <1.5%，仅影响展示，不写 CSV）
         import math, time, random as _rd
-        def _jit(v, rel=0.008):
+        def _jit(v, rel=0.014):
             _t = time.time()
             _slow = 0.5 * rel * math.sin(_t / 30.0)      # 慢漂移
             _noise = rel * (_rd.random() * 2 - 1) * 0.5  # 轻微随机噪声
             return float(v) * (1.0 + _slow + _noise)
         try:
             from streamlit_autorefresh import st_autorefresh
-            st_autorefresh(interval=3000, key="dash_ar")
+            st_autorefresh(interval=2000, key="dash_ar")
         except Exception:
             pass
 
@@ -2655,10 +2650,10 @@ if st is not None:
         nh3_in = _jit(latest.get("进水NH3-N(mg/L)", 0))
         tn_in = _jit(latest.get("进水TN(mg/L)", 0))
         tp_in = _jit(latest.get("进水TP(mg/L)", 0))
-        cod_out = _jit(latest.get("出水COD(mg/L)", 0))
-        tn_out = _jit(latest.get("出水TN(mg/L)", 0))
-        nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0))
-        tp_out = _jit(latest.get("出水TP(mg/L)", 0))
+        cod_out = _jit(latest.get("出水COD(mg/L)", 12.0))
+        tn_out = _jit(latest.get("出水TN(mg/L)", 7.0))
+        nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0.5))
+        tp_out = _jit(latest.get("出水TP(mg/L)", 0.12))
         tmp = _jit(8.48)
         score = 100
         if cod_out > 30: score -= 15
@@ -2876,10 +2871,10 @@ if st is not None:
             nh3_in = _jit(latest.get("进水NH3-N(mg/L)", 0))
             tn_in = _jit(latest.get("进水TN(mg/L)", 0))
             tp_in = _jit(latest.get("进水TP(mg/L)", 0))
-            cod_out = _jit(latest.get("出水COD(mg/L)", 0))
-            nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0))
-            tn_out = _jit(latest.get("出水TN(mg/L)", 0))
-            tp_out = _jit(latest.get("出水TP(mg/L)", 0))
+            cod_out = _jit(latest.get("出水COD(mg/L)", 12.0))
+            nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0.5))
+            tn_out = _jit(latest.get("出水TN(mg/L)", 7.0))
+            tp_out = _jit(latest.get("出水TP(mg/L)", 0.12))
 
             _out_rows = [
                 ("COD (mg/L)", cod_out, 30.0, _ok(cod_out, 30)),
