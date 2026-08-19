@@ -18,6 +18,10 @@ try:
 except ImportError:
     go = None
 try:
+    from plotly.subplots import make_subplots
+except ImportError:
+    make_subplots = None
+try:
     import reportlab
     HAS_REPORTLAB = True
 except ImportError:
@@ -621,6 +625,9 @@ def influent_surge_note(var, series, forecast, season=24):
 
 def _build_sample_df(hours=24*60, seed=20260808):
     """生成 AI 预测页使用的合成演示数据（与 gen_sample_data.py 等价）。
+    工况设定：市政污水，设计规模 2 万 m³/d，二沉池后接浸没式超滤（UF）深度处理，
+    出水执行准 IV 类标准（COD≤30、NH3-N≤1.5、TN≤15、TP≤0.3），
+    出水指标绝大部分落在限值 45%–70% 区间，稳定达标、仅小幅波动。
     部署时若 sample_wwtp_history.csv 缺失，可即时在内存生成，无需额外文件。"""
     if pd is None:
         raise RuntimeError("需要 pandas 才能生成示例数据")
@@ -631,45 +638,57 @@ def _build_sample_df(hours=24*60, seed=20260808):
     dow = t.dayofweek.to_numpy()
     day_idx = np.arange(hours)
 
+    # 日变化系数：市政污水早晚两个高峰
     diurnal = 0.5 * np.sin(2 * np.pi * (hour - 4) / 24) + 0.5 * np.sin(2 * np.pi * (hour - 16) / 24)
     diurnal = (diurnal - diurnal.min()) / (diurnal.max() - diurnal.min())
-    week_factor = np.where(dow >= 5, 0.88, 1.0)
-    trend = 1.0 + 0.08 * np.sin(2 * np.pi * day_idx / (24 * 30))
+    week_factor = np.where(dow >= 5, 0.92, 1.0)
+    trend = 1.0 + 0.06 * np.sin(2 * np.pi * day_idx / (24 * 30))
 
-    base_flow = 420.0
-    flow = base_flow * (0.55 + 0.55 * diurnal) * week_factor * trend
-    flow *= (1 + rng.normal(0, 0.05, hours))
-    flow = np.clip(flow, 200, 900)
+    # 设计规模 2 万 m³/d → 平均 833 m³/h；归一化使日均流量精确等于 2 万方，峰值约 1100 m³/h（Kz≈1.32）
+    base_flow = 20000.0 / 24.0
+    shape = (0.55 + 0.55 * diurnal) * week_factor * trend
+    shape *= (1 + rng.normal(0, 0.05, hours))
+    shape /= shape.mean()
+    flow = base_flow * shape
+    flow = np.clip(flow, 450, 1100)
 
+    # 进水：典型市政污水（COD 250–450 / NH3-N 30–50 / TN 45–60 / TP 4–7）
     def polluant(base, cv, spike_prob, spike_mul):
         val = base * (1 + rng.normal(0, cv, hours))
         spike = rng.random(hours) < spike_prob
         val[spike] *= rng.uniform(spike_mul, spike_mul + 0.6, spike.sum())
         return np.clip(val, base * 0.3, None)
 
-    cod_in = polluant(350, 0.10, 0.04, 1.4)
-    nh3_in = polluant(28, 0.10, 0.03, 1.3)
-    tn_in = nh3_in + polluant(13, 0.10, 0.02, 1.2)
+    cod_in = polluant(350, 0.12, 0.04, 1.4)
+    nh3_in = polluant(35, 0.12, 0.03, 1.3)
+    tn_in = nh3_in + polluant(20, 0.10, 0.02, 1.2)
     tp_in = polluant(5.0, 0.12, 0.03, 1.4)
 
-    def effluent(inf, removal, std, occasional, spike_low=1.3, spike_high=1.8):
-        out = inf * (1 - removal) + rng.normal(0, std, hours)
-        hit = (inf > np.percentile(inf, 92)) & (rng.random(hours) < occasional)
-        out[hit] = out[hit] * rng.uniform(spike_low, spike_high, hit.sum())
-        return np.clip(out, 0.05, None)
+    # 出水（二沉池出水）：绝大部分落在限值 45%–70% 区间，稳定达标
+    def effluent_in_band(limit):
+        lo, hi = 0.45 * limit, 0.70 * limit
+        center = (lo + hi) / 2.0
+        half = (hi - lo) / 2.0
+        # 3 天慢漂移 + 小幅噪声，使序列在区间内自然波动
+        drift = 0.5 * np.sin(2 * np.pi * day_idx / (24 * 3) + 1.0)
+        val = center + half * drift + rng.normal(0, half * 0.22, hours)
+        return np.clip(val, lo * 0.95, hi * 1.03)
 
-    # 出水COD：演示数据严格控制在 8–20 mg/L，不出现超标点（标准限值 30）
-    cod_out = effluent(cod_in, 0.96, 0.8, 0.0, spike_low=1.0, spike_high=1.0)
-    cod_out = np.clip(cod_out, 8.0, 20.0)
+    cod_out = effluent_in_band(30.0)   # 13.5–21 mg/L
+    nh3_out = effluent_in_band(1.5)    # 0.675–1.05 mg/L
+    tn_out = effluent_in_band(15.0)    # 6.75–10.5 mg/L
+    tp_out = effluent_in_band(0.3)     # 0.135–0.21 mg/L
 
-    nh3_out = effluent(nh3_in, 0.965, 0.3, 0.4)
-    tn_out = effluent(tn_in, 0.70, 1.0, 0.5)
-    tp_out = effluent(tp_in, 0.93, 0.05, 0.4)
+    # 浸没式超滤（UF）深度处理：截留悬浮物/胶体/浊度，溶解态污染物基本不变
+    # UF 出水 COD 略低于二沉出水（去除颗粒态部分），浊度 <0.1 NTU，跨膜压差 TMP 随运行波动
+    uf_cod_out = cod_out * (1 - rng.uniform(0.02, 0.06, hours))
+    uf_turb = rng.uniform(0.03, 0.09, hours)
+    tmp = 18.0 + 10.0 * np.sin(2 * np.pi * day_idx / (24 * 7)) + rng.normal(0, 1.2, hours)
 
-    energy = 760 + 0.45 * flow + rng.normal(0, 35, hours)
-    energy = np.clip(energy, 400, None)
-    chem = 18 + 0.02 * flow + 6 * (tp_out > 0.45) + rng.normal(0, 2.5, hours)
-    chem = np.clip(chem, 5, None)
+    energy = 1500 + 0.40 * flow + rng.normal(0, 40, hours)
+    energy = np.clip(energy, 900, None)
+    chem = 30 + 0.02 * flow + 6 * (tp_out > 0.19) + rng.normal(0, 2.5, hours)
+    chem = np.clip(chem, 10, None)
 
     return pd.DataFrame({
         "时间": t.strftime("%Y-%m-%d %H:%M"),
@@ -682,6 +701,9 @@ def _build_sample_df(hours=24*60, seed=20260808):
         "出水NH3-N(mg/L)": np.round(nh3_out, 2),
         "出水TN(mg/L)": np.round(tn_out, 2),
         "出水TP(mg/L)": np.round(tp_out, 3),
+        "UF出水COD(mg/L)": np.round(uf_cod_out, 1),
+        "UF出水浊度(NTU)": np.round(uf_turb, 2),
+        "跨膜压差(kPa)": np.round(tmp, 1),
         "电耗(kWh/h)": np.round(energy, 1),
         "药耗(kg/h)": np.round(chem, 1),
     })
@@ -986,16 +1008,22 @@ if st is not None:
     }
     .stApp{ background:linear-gradient(135deg,var(--bg1) 0%,var(--bg2) 100%) !important; }
     #MainMenu, footer{ display:none !important; }
-    /* 隐藏顶部栏，消除顶部空白；同时隐藏侧边栏折叠按钮，使其保持展开 */
+    /* 隐藏 Streamlit 顶部横幅（Deploy/Running man），消除标题上方空白 */
     header[data-testid="stHeader"]{ display:none !important; }
-    [data-testid="stSidebarCollapseButton"]{ display:none !important; }
-    .main .block-container{ padding-top:2.2rem; padding-bottom:3rem; }
+    .stApp > header{ display:none !important; }
+    /* 压缩主内容区顶部边距 */
+    .main .block-container,
+    .block-container{ padding-top:0rem !important; padding-bottom:3rem; }
+    .appview-container,
+    [data-testid="stAppViewContainer"]{ padding-top:0rem !important; }
+    .appview-container > .main,
+    [data-testid="stAppViewContainer"] > .main{ padding-top:0rem !important; margin-top:0rem !important; }
 
     /* 标题体系 */
     h1{ font-size:1.7rem; font-weight:700; color:var(--text);
-        border-left:5px solid var(--primary); padding-left:14px; margin-bottom:.6rem; }
-    h2{ font-size:1.28rem; font-weight:650; color:var(--text); }
-    h3{ font-size:1.05rem; font-weight:600; color:var(--text); }
+        border-left:5px solid var(--primary); padding-left:14px; margin-top:0; margin-bottom:.6rem; }
+    h2{ font-size:1.28rem; font-weight:650; color:var(--text); margin-top:0; }
+    h3{ font-size:1.05rem; font-weight:600; color:var(--text); margin-top:0; }
     .stCaption{ color:var(--text2) !important; }
     .stMarkdown p{ color:var(--text2); }
 
@@ -1066,11 +1094,9 @@ if st is not None:
     # 未登录时显示登录页
 
     if not st.session_state.logged_in:
-        # —— 登录页专属样式：仅登录页隐藏侧边栏/顶栏，并美化表单 ——
+        # —— 登录页专属样式：美化表单，不隐藏全局侧边栏/顶栏 ——
         st.markdown(r"""
         <style>
-        [data-testid="stSidebar"]{ display:none !important; }
-        header[data-testid="stHeader"]{ display:none !important; }
         #login-scope ~ .element-container [data-testid="stTextInput"]{ max-width:320px; margin:0 auto; }
         #login-scope ~ .element-container [data-testid="stButton"]{ max-width:320px; margin:14px auto 0; }
         #login-scope ~ .element-container [data-testid="stTextInput"] input{
@@ -1240,6 +1266,9 @@ if st is not None:
     # ================= 侧边栏导航 =================
     with st.sidebar:
         logo_path = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
+        if not os.path.exists(logo_path):
+            # 兼容从父目录运行的情况
+            logo_path = os.path.join(os.path.dirname(__file__), "污水厂管理系统", "assets", "logo.png")
         if os.path.exists(logo_path):
             st.image(logo_path, width=260)
         st.title("🏭 系统导航")
@@ -1248,11 +1277,12 @@ if st is not None:
         page = st.radio(
             "功能模块",
             [
+                "🛰️ 数字孪生驾驶舱",
                 "📝 基础参数设置",
                 "💧 水力与负荷校核",
                 "🧪 生化核心计算",
                 "🏞️ 二沉池专项校核",
-                "⚙️ 工况调节建议",
+                "💠 浸没式超滤工况",
                 "💰 成本经济核算",
                 "🔮 AI 预测预警",
                 "🛠️ AI 工艺优化与诊断",
@@ -1260,10 +1290,6 @@ if st is not None:
                 "📊 报表导出"
             ]
         )
-        st.markdown("---")
-        st.caption("工艺路线：厌氧→缺氧1→好氧1→缺氧2→好氧2→二沉池")
-        st.caption("内回流：好氧1 → 缺氧1；好氧1自流至缺氧2深度反硝化")
-        st.caption("好氧2功能：吹脱氮气 + 防止二沉池反硝化")
         st.markdown("---")
         if "_llm_status" not in st.session_state:
             st.session_state._llm_status = check_llm_config()
@@ -1483,11 +1509,13 @@ if st is not None:
         st.subheader("一、运行参数输入")
         col1, col2, col3 = st.columns(3)
         with col1:
-            cod_in = num_input("进水COD (mg/L)", value=350)
-            bod_in = num_input("进水BOD5 (mg/L)", value=180)
+            cod_in = num_input("进水COD (mg/L)", value=210)
+            bod_in = num_input("进水BOD5 (mg/L)", value=130)
             nh3_in = num_input("进水氨氮 (mg/L)", value=28)
-            tn_in = num_input("进水总氮 TN (mg/L)", value=40)
+            tn_in = num_input("进水总氮 TN (mg/L)", value=57)
             tp_in = num_input("进水总磷 TP (mg/L)", value=5)
+            R1 = num_input("内回流比 R1 (好氧1→缺氧1, %)", value=200) / 100
+            waste_sludge_volume = num_input("每日外排剩余污泥量(m³/d)", value=20.0)
         with col2:
             tn_out_target = num_input("出水TN目标 (mg/L)", value=15)
             tp_out_target = num_input("出水TP目标 (mg/L)", value=0.5)
@@ -1496,8 +1524,6 @@ if st is not None:
             nh3_eff = num_input("实际出水氨氮 (mg/L)", value=1.5)
             mlss = num_input("MLSS 混合液浓度 (mg/L)", value=3500)
             R = num_input("污泥回流比 R (%)", value=100) / 100
-            R1 = num_input("内回流比 R1 (好氧1→缺氧1, %)", value=200) / 100
-            waste_sludge_volume = num_input("每日外排剩余污泥量(m³/d)", value=20.0)
 
         with col3:
             phos_agent_type = st.selectbox("除磷药剂类型", ["聚合氯化铝 PAC（铝盐）", "聚合硫酸铁 PFS（铁盐）"])
@@ -1819,141 +1845,198 @@ if st is not None:
             if res['ssl'] >= 150:
                 st.warning("跑泥风险：建议提高污泥回流比、降低进水量、增加排泥频次")
             st.info("好氧池末端维持1.0~2.0mg/L DO，可有效防止二沉池内反硝化导致的污泥上浮")
-    # ================= 页面5：工况调节建议 =================
-    elif page == "⚙️ 工况调节建议":
-        st.header("⚙️ 进水水质波动工况智能调节方案")
-        st.caption("选择当前异常工况，自动输出全套量化调节参数")
+    # ================= 页面5：浸没式超滤工况 =================
+    elif page == "💠 浸没式超滤工况":
+        st.header("💠 浸没式超滤实时工况监控")
+        st.caption("模拟实时监测 + 预警 + AI 运维指导")
+        #：运行通量 22~26 LMH、跨膜压差(TMP) 5~15 kPa 缓慢上升、"
+        #           "曝气强度 60~70 m³/(m²·h) 波动、出水浊度 0.02~0.06 NTU 波动；TMP 报警限值 35 kPa
+        bp = st.session_state.base_params
 
-        condition = st.selectbox("选择异常工况", [
-            "水量冲击负荷",
-            "进水氨氮突高",
-            "进水总氮超标 / 低C/N",
-            "进水总磷超标",
-            "进水SS偏高 / 污泥膨胀风险",
-            "进水COD突增",
-            "出水SS升高 / 二沉池跑泥"
-        ])
+        # ---------- ① 现场信息（膜系统配置，用于 CEB 预测与校核） ----------
+        with st.expander("① 现场信息录入（膜系统配置，用于 CEB 预测与校核）", expanded=True):
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                Q_uf = num_input("UF 设计处理水量 (m³/d)", value=bp['Q_design'], min_value=0.0, key="uf_Q")
+                area_per_module = num_input("单支膜组件面积 (m²)", value=18.0, min_value=0.0, key="uf_area")
+            with c2:
+                modules_per_rack = num_input("单膜箱/膜架组件数", value=42, min_value=1, key="uf_mod")
+                rack_count = num_input("膜箱/膜架数量", value=40, min_value=1, key="uf_rack")
+            with c3:
+                recovery = num_input("设计回收率 (%)", value=96.0, min_value=50.0, max_value=100.0, key="uf_rec")
+                tmp_alarm = num_input("TMP 报警限值 (kPa)", value=35.0, min_value=10.0, key="uf_alarm")
+            with c4:
+                ceb_thr = num_input("CEB 反洗触发 TMP (kPa)", value=15.0, min_value=10.0, key="uf_ceb")
+                run_days = num_input("已连续运行天数", value=42, min_value=0, key="uf_days")
+            area_installed = area_per_module * modules_per_rack * rack_count
+            st.caption(f"已安装膜面积 ≈ {area_installed:.0f} m²（{modules_per_rack:.0f}×{rack_count:.0f} 支组件）；"
+                       f"设计产水量 ≈ {Q_uf*recovery/100:.0f} m³/d")
 
-        plans = {
-            "水量冲击负荷": """
-            ### 📌 水量冲击负荷调节方案
-            1. **回流系统**
-               - 污泥回流比 R：从100%提升至 **120%~150%**，防止二沉池污泥堆积
-               - 内回流比 R1：提升至 **250%~300%**，维持脱氮效果
-            2. **曝气与DO**
-               - 一级好氧DO提高至 **2.5~3.0 mg/L**，防止硝化崩溃
-               - 二级好氧DO维持 **1.0~2.0 mg/L**，保证吹脱氮气效果
-            3. **污泥控制**
-               - 可适当提高MLSS，增强抗冲击能力
-               - 排泥量加大 **10%~20%**，避免污泥在二沉池停留过久
-            4. **药剂**
-               - 可适当增加除磷剂的投加量
-               - 若C/N不足，应及时增加碳源投加量
-            5. **注意**：加强二沉池巡视，增加SV30监测频次至每2小时一次
-            """,
+        # ---------- 模拟状态初始化 ----------
+        if 'uf_sim' not in st.session_state:
+            st.session_state.uf_sim = {'t': [], 'flux': [], 'tmp': [], 'aer': [], 'turb': []}
+            st.session_state.uf_t = 0
+        sim = st.session_state.uf_sim
 
-            "进水氨氮突高": """
-            ### 📌 进水氨氮突高调节方案
-            1. **曝气系统**
-               - 第一好氧池DO提升至 **2.5~3.5 mg/L**，强化硝化（全部硝化在好氧1完成）
-               - 第二好氧DO同步维持 **1.5~2.0 mg/L**，防止出水带氨
-            2. **污泥系统**
-               - 排泥量减少 **20%~30%**，延长污泥龄SRT至 **15d以上**，保留硝化菌
-               - 可适当提高MLSS
-            3. **回流系统**
-               - 内回流R1提升至 **250%~300%**，将硝化液充分送回缺氧池
-            4. **应急措施**
-               - 氨氮超幅>50%时，可临时投加硝化菌剂，缩短恢复周期
-               - 除磷药剂维持不变，优先保障硝化
-            """,
+        def uf_step():
+            t = st.session_state.uf_t + 1
+            # TMP 缓慢上升趋势：起始约 5 kPa，随运行天数与采样帧数线性抬升 + 噪声
+            base_tmp = 5.0 + 0.06 * run_days + 0.05 * t
+            tmp = base_tmp + float(np.random.normal(0, 0.35))
+            tmp = max(tmp, 3.0)
+            flux = float(np.random.uniform(22, 26))
+            aer = float(np.random.uniform(60, 70))
+            turb = float(np.random.uniform(0.02, 0.06))
+            sim['t'].append(t)
+            sim['flux'].append(flux)
+            sim['tmp'].append(tmp)
+            sim['aer'].append(aer)
+            sim['turb'].append(turb)
+            st.session_state.uf_t = t
 
-            "进水总氮超标 / 低C/N": """
-                    ### 📌 总氮超标 / 低C/N调节方案
-                    1. **碳源投加**
-                       - 加大第一缺氧池碳源投加量，补充反硝化电子供体，优先保障主反硝化段脱氮效率
-                       - 同步提升第二缺氧池碳源投加量，强化深度反硝化，进一步削减出水总氮
-                       - 优先选用乙酸钠，反硝化速率快、响应及时，适配低C/N下快速提标需求
-                    2. **溶解氧管控**
-                       - 控制好氧1段出水溶解氧水平，降低内回流液携带的溶氧量，避免破坏缺氧1段的缺氧反应环境，保障主反硝化稳定运行
-                       - 严格维持缺氧1、缺氧2池内DO＜0.3 mg/L，保证反硝化菌活性与反应速率，避免硝态氮积累导致出水总氮超标
-                       - 第二好氧DO控制在1.0~1.5 mg/L，保障末端残留氨氮硝化效果，同时吹脱水中夹带的氮气，改善二沉池污泥沉降性能
-                    3. **回流比优化**
-                       - 提高内回流R1比例，将更多硝态氮输送至缺氧1段进行反硝化，提升系统总氮去除率
-                       - 污泥回流比维持现有水平，不宜过高，避免过量溶氧随回流污泥进入厌氧/缺氧段
-                    4. **工艺调整**
-                       - 在出水氨氮稳定达标、硝化效果有富余的前提下，可适度降低MLSS，减少污泥内源呼吸对碳源的无效消耗，将系统有限碳源优先供给反硝化脱氮
-                       - 结合水温与出水氨氮动态调控污泥龄，常温工况控制在12~15d；低温期适当延长以保障硝化菌群，高温期可适度缩短以降低内源碳耗
-                    """,
+        # ---------- ② 实时监测模拟控制 ----------
+        st.markdown("---")
+        st.subheader("② 实时监测模拟")
+        b1, b2, b3 = st.columns([1, 1, 1])
+        with b1:
+            if st.button("▶ 开始 / 重置模拟", type="primary", key="uf_start"):
+                st.session_state.uf_sim = {'t': [], 'flux': [], 'tmp': [], 'aer': [], 'turb': []}
+                st.session_state.uf_t = 0
+                st.rerun()
+        with b2:
+            if st.button("⏭ 采集下一帧", key="uf_next"):
+                uf_step()
+                st.rerun()
+        with b3:
+            auto = st.checkbox("自动滚动（每 1.5 s 一帧）", value=True, key="uf_auto")
+            if auto:
+                try:
+                    from streamlit_autorefresh import st_autorefresh
+                    # 该组件在后台 1.5s 后自动触发 rerun；每次 rerun 进入本分支都会再采集一帧
+                    st_autorefresh(interval=1500, key="uf_autorefresh")
+                    uf_step()
+                except ImportError:
+                    st.warning("⚠️ 自动滚动需要 `pip install streamlit-autorefresh`，当前未安装，已降级为手动模式。")
 
-            "进水总磷超标": """
-                    ### 📌 进水总磷超标调节方案
-                    1. **生物除磷强化（优先执行，降低药剂成本）**
-                       - 严格控制厌氧池DO＜0.2 mg/L，减少回流污泥、内回流携带的溶解氧，保证聚磷菌厌氧释磷环境
-                       - 保障厌氧池易降解碳源供给，进水C/P不足时，可在厌氧池前端补充少量碳源，强化聚磷菌释磷动力，提升后续好氧吸磷效率
-                       - 在满足出水氨氮达标的前提下，适度缩短污泥龄SRT，富集聚磷菌；常温市政污水常规控制在8~12d，低温期需兼顾硝化适当延长
-                       - 稳定加大剩余污泥排放量，通过排泥将富磷污泥排出系统；排泥过程维持生化池MLSS稳定，避免大幅波动冲击系统
-                    2. **化学除磷强化（补充生物除磷缺口，保障达标）**
-                       - 日常调控优先采用同步投加（好氧池末端/二沉池进水渠），利用混合液紊流完成混凝反应，通过二沉池沉淀去除磷酸盐；超幅较大需应急提标时，启用二沉池后深度处理段后置投加
-                       - 投加量按生物除磷后的出水TP缺口动态核算，缺口越大、出水标准越严，摩尔比（安全系数）取高值
-                       - 进水TP超幅过大、PAC投加量接近上限时，可换用聚合硫酸铁（PFS）强化除磷；铁盐除磷效率更高，需同步监控出水pH与色度
-                    3. **配套管控注意事项**
-                       - 控制好氧段末端DO不宜过高，避免大量溶解氧随回流污泥进入厌氧池，破坏释磷环境
-                       - 强化二沉池运行管控，稳定污泥层高度，避免污泥流失导致颗粒态磷随出水超标
-                       - 碳源充足工况优先挖掘生物除磷潜力，减少化学药剂投加量，降低污泥产量与运行成本
-                    """,
+        if not sim['t']:
+            uf_step()
 
-            "进水SS偏高 / 污泥膨胀风险": """
-            ### 📌 进水SS偏高 / 污泥膨胀调节方案
-            1. **前端预处理**
-               - 检查格栅、沉砂池运行状态，强化初沉池沉淀效果
-               - 可在初沉池临时投加PAC，降低进水SS负荷
-            2. **生化系统**
-               - 好氧池DO提高至 **2.5~3.0 mg/L**，抑制丝状菌膨胀
-               - 加大排泥量，降低MLSS，缩短污泥龄
-               - 严格控制厌氧池DO，防止丝状菌过度繁殖
-            3. **药剂辅助**
-               - 好氧池可少量投加PAC，改善污泥沉降性能
-               - 消泡剂按需投加，防止泡沫夹带污泥流失
-            4. **监测**：每2小时测一次SV30和SVI，跟踪沉降性能变化
-            """,
-
-            "进水COD突增": """
-                    ### 📌 进水COD突增调节方案
-                    1. **曝气系统调控**
-                       - 第一好氧池为主降解与硝化段，DO提升至2.5~3.0 mg/L，保障异养菌降解有机物与自养菌硝化的需氧量，避免DO不足导致出水COD、氨氮同步超标
-                       - 第二好氧池DO维持1.5~2.0 mg/L，保障末端有机物与氨氮深度处理，同时吹脱水中夹带的氮气，抑制二沉池反硝化浮泥风险
-                       - 冲击期间加密监测末端DO，避免过曝气浪费能耗、增加回流带氧损耗
-                    2. **污泥系统管控**
-                       - 稳定控制MLSS
-                       - 定期监测SVI，防止高负荷下DO不足诱发丝状菌污泥膨胀
-                    3. **脱氮除磷优化**
-                       - 进水碳源充足时，根据出水总氮、硝态氮数据，在达标前提下逐步减少直至停止外加碳源投加，降低运行成本
-                       - 厌氧段碳源提升会强化生物除磷效果，可在出水总磷稳定达标的前提下，适当降低化学除磷药剂投加量
-                    4. **运行注意事项**
-                       - 加密巡查二沉池污泥层高度，防止污泥增殖过快、固体负荷升高引发跑泥
-                       - 冲击幅度过大时，优先保障出水COD与氨氮达标，同步管控总氮、总磷指标
-                    """,
-
-            "出水SS升高 / 二沉池跑泥": """
-                    ### 📌 出水SS升高 / 二沉池跑泥调节方案
-                    1. **水力与负荷排查**
-                       - 若为进水水量骤增导致表面负荷超限，优先启用调蓄池削峰错峰，控制进水流量；无调蓄条件的严控进水负荷，严禁未经达标处理的超越排放
-                       - 核算二沉池固体负荷，若因MLSS过高、回流比过大导致负荷超限，优先加大剩余污泥排放，降低系统污泥总量
-                    2. **污泥性状排查与处置**
-                       - 检测SVI并配合污泥镜检，判断是否发生丝状菌污泥膨胀；若确认膨胀，按污泥膨胀专项方案处置
-                       - 若为污泥老化（SVI偏低、絮体细碎、泥质松散），需加大剩余污泥排放量，缩短污泥龄，提高污泥负荷，改善污泥絮凝沉降性能
-                       - 若为二沉池反硝化浮泥（泥面夹带小气泡、污泥成片上浮），提高第二好氧池DO，同时加大污泥回流与排泥，减少二沉池污泥停留时间
-                    3. **运行参数调整**
-                       - 二沉池泥层过高、存在跑泥风险时，可临时提高污泥回流比10%~20%，快速压低污泥层高度；需同步核算固体负荷，避免负荷超限加剧跑泥
-                       - 反硝化浮泥情况下，适当提升第二好氧池DO至2.0 mg/L左右，抑制二沉池内反硝化反应
-                    4. **应急处置措施**
-                       - 出水SS超标严重时，可在二沉池进水渠临时投加PAC助凝沉淀；非紧急情况不投加PAM，避免长期投加恶化污泥活性
-                       - 检查刮吸泥机运行状态，确保排泥通畅；间歇运行设备可临时增加运行频次，及时排出池底积泥
-                    """,
-        }
+        # ---------- ③ 当前实时指标与预警 ----------
+        t_now = sim['t'][-1]
+        flux_now = sim['flux'][-1]
+        tmp_now = sim['tmp'][-1]
+        aer_now = sim['aer'][-1]
+        turb_now = sim['turb'][-1]
 
         st.markdown("---")
-        st.markdown(plans[condition])
+        st.subheader("③ 当前实时指标与预警")
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("运行通量", f"{flux_now:.1f} LMH", help="设计区间 22~26 LMH")
+        with m2:
+            delta = tmp_now - sim['tmp'][-2] if len(sim['tmp']) > 1 else None
+            st.metric("跨膜压差 TMP", f"{tmp_now:.2f} kPa",
+                      delta=f"{delta:+.2f}" if delta is not None else None)
+        with m3:
+            st.metric("曝气强度", f"{aer_now:.1f} m³/(m²·h)", help="设计区间 60~70")
+        with m4:
+            st.metric("出水浊度", f"{turb_now:.3f} NTU", help="设计区间 0.02~0.06")
+
+        if tmp_now >= tmp_alarm:
+            st.error(f"⛔ TMP 已达报警限值（{tmp_alarm:.0f} kPa）：立即执行 CIP 化学清洗 / 完整性检测，必要时降负荷")
+        elif tmp_now >= ceb_thr:
+            st.warning(f"⚠️ TMP 超过 CEB 反洗阈值（{ceb_thr:.0f} kPa）：建议尽快安排 CEB 加强反洗")
+        else:
+            st.success(f"✅ 工况正常：TMP 距 CEB 阈值尚有 {ceb_thr - tmp_now:.1f} kPa 余量")
+
+        # ---------- ④ 运行趋势 ----------
+        st.markdown("---")
+        st.subheader("④ 运行趋势")
+        df = pd.DataFrame({'帧': sim['t'], 'TMP(kPa)': sim['tmp'], '通量(LMH)': sim['flux'],
+                           '曝气(m³/m²·h)': sim['aer'], '浊度(NTU)': sim['turb']})
+        if go is not None:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df['帧'], y=df['TMP(kPa)'], name='TMP', line=dict(color='#0e7490', width=2)))
+            fig.add_hline(y=ceb_thr, line=dict(color='#d97706', dash='dash'),
+                          annotation_text='CEB阈值', annotation_position='top left')
+            fig.add_hline(y=tmp_alarm, line=dict(color='#dc2626', dash='dash'),
+                          annotation_text='报警限值', annotation_position='top left')
+            fig.update_layout(height=320, margin=dict(t=20, b=40, l=40, r=20), legend=dict(orientation='h'))
+            st.plotly_chart(fig, use_container_width=True)
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(x=df['帧'], y=df['通量(LMH)'], name='通量', yaxis='y1'))
+            fig2.add_trace(go.Scatter(x=df['帧'], y=df['曝气(m³/m²·h)'], name='曝气', yaxis='y1'))
+            fig2.add_trace(go.Scatter(x=df['帧'], y=df['浊度(NTU)'], name='浊度', yaxis='y2'))
+            fig2.update_layout(height=300, margin=dict(t=20, b=40, l=40, r=40),
+                               yaxis=dict(title='通量/曝气'),
+                               yaxis2=dict(title='浊度(NTU)', overlaying='y', side='right', range=[0, 0.1]))
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.line_chart(df.set_index('帧')[['TMP(kPa)', '通量(LMH)', '曝气(m³/m²·h)', '浊度(NTU)']])
+
+        # ---------- ⑤ AI 预测与运维指导 ----------
+        st.markdown("---")
+        st.subheader("⑤ AI 预测与运维指导")
+        n = len(sim['tmp'])
+        # 稳定斜率：取近 30 帧帧间增量的中位数，抑制单帧噪声导致的预测跳动
+        if n >= 10:
+            win = min(n, 30)
+            _inc = np.diff(sim['tmp'][-win:])
+            slope = float(np.median(_inc)) if len(_inc) else 0.0
+        else:
+            slope = 0.0
+        pred_lines = []
+        if n < 10:
+            pred_lines.append("- 样本不足（需≥10帧），继续采集以稳定 CEB/报警预测。")
+        elif slope > 1e-4:
+            frames_to_ceb = (ceb_thr - tmp_now) / slope
+            frames_to_alarm = (tmp_alarm - tmp_now) / slope
+            pred_lines.append(
+                f"- **CEB 反洗预测**：按当前上升趋势（≈{slope:.3f} kPa/帧，基于近{min(n,30)}帧中位增量），"
+                f"约 **{max(frames_to_ceb, 0):.0f} 帧**后达到 CEB 阈值（{ceb_thr:.0f} kPa），"
+                f"约合 **{max(frames_to_ceb, 0)/24:.1f} 天**（按 24 帧/天计）。")
+            if frames_to_alarm > 0:
+                pred_lines.append(
+                    f"- **报警预测**：约 **{frames_to_alarm:.0f} 帧**后触及报警限值（{tmp_alarm:.0f} kPa），"
+                    f"约合 **{frames_to_alarm/24:.1f} 天**；请在报警前完成 CEB。")
+            else:
+                pred_lines.append("- **报警预测**：当前 TMP 已超过报警限值，需立即处置。")
+        else:
+            pred_lines.append("- 当前 TMP 趋势平稳（斜率≈0），未见明显污染上升，维持现有维护性清洗周期即可。")
+
+        anomalies = []
+        if aer_now < 60:
+            anomalies.append("曝气强度低于 60 m³/(m²·h)，膜面剪切不足，易加速污染——建议提高曝气。")
+        elif aer_now > 70:
+            anomalies.append("曝气强度高于 70，能耗偏高但利于控污——可酌情下调。")
+        if turb_now > 0.06:
+            anomalies.append("出水浊度 >0.06 NTU，疑似膜丝破损或断丝——建议做完整性检测。")
+        if tmp_now >= ceb_thr and slope > 0:
+            anomalies.append("TMP 已超 CEB 阈值且仍在上升，判断为可逆污染主导，优先 CEB（次氯酸钠/柠檬酸）而非 CIP。")
+
+        st.info("**AI 趋势预测（机理+统计）**\n" + "\n".join(pred_lines))
+        if anomalies:
+            st.warning("**AI 异常诊断（规则引擎）**\n- " + "\n- ".join(anomalies))
+        else:
+            st.success("**AI 异常诊断**：各参数均在正常波动区间，未发现异常。")
+
+        # 高阶 AI：调用大模型生成自然语言运维建议（需配置 GLM-4-Flash 等，离线时自动降级规则引擎）
+        _llm_mode = st.session_state.get('_llm_status', ('offline',))[0]
+        st.caption(f"AI 能力档位：当前为「{_llm_mode}」模式"
+                   f"（offline=离线规则引擎；local/cloud=已接入大模型，可生成自然语言诊断报告）")
+        if st.button("🤖 调用大模型生成运维诊断报告", key="uf_ai"):
+            ctx = (f"现场信息：UF设计水量{Q_uf:.0f} m³/d，已安装膜面积{area_installed:.0f} m²，"
+                   f"回收率{recovery:.0f}%，已连续运行{run_days:.0f}天。\n"
+                   f"当前实时：通量{flux_now:.1f} LMH，TMP{tmp_now:.2f} kPa（CEB阈值{ceb_thr:.0f}，报警{tmp_alarm:.0f}），"
+                   f"曝气{aer_now:.1f} m³/(m²·h)，出水浊度{turb_now:.3f} NTU。\n"
+                   f"TMP趋势斜率≈{slope:.3f} kPa/帧。")
+            q = ("请作为膜法水处理工程师，给出：1) TMP 上升的根因判断；2) 是否需要及何时安排 CEB 反洗；"
+                 "3) 具体清洗配方与运行调整建议；4) 防止进一步污染的措施。语言简洁专业。")
+            out = st.empty()
+            text = ""
+            for piece in ai_assistant_stream(q, ctx, kb_dir=None):
+                text += piece
+                out.markdown(text)
 
 
     # ================= 页面6：成本经济核算 =================
@@ -2234,7 +2317,7 @@ if st is not None:
                 with col2:
                     st.plotly_chart(fig, use_container_width=True)
 
-    # ================= 页面7：报表导出 =================
+    # ================= 页面13：报表导出 =================
     elif page == "📊 报表导出":
         st.header("📊 计算报表导出")
         st.caption("将当前所有计算结果汇总导出为排版精美的中文 PDF 报表（中文字体已嵌入，手机/电脑均可直接查看）")
@@ -2317,19 +2400,25 @@ if st is not None:
         if not os.path.exists(SAMPLE_CSV):
             st.info("⚙️ 未找到本地示例数据，正在即时生成合成演示数据…")
             df = _build_sample_df()
+            saved = False
             try:
                 df.to_csv(SAMPLE_CSV, index=False, encoding="utf-8-sig")
+                saved = True
             except Exception:
                 pass
+            if saved:
+                st.rerun()
         else:
             df = pd.read_csv(SAMPLE_CSV)
             df["时间"] = pd.to_datetime(df["时间"])
             df = df.set_index("时间").sort_index()
             var_options = {
-                "出水COD(mg/L)": 30, "出水NH3-N(mg/L)": 5, "出水TN(mg/L)": 15,
-                "出水TP(mg/L)": 0.5, "进水流量(m3/h)": None, "进水COD(mg/L)": None,
+                "出水COD(mg/L)": 30, "出水NH3-N(mg/L)": 1.5, "出水TN(mg/L)": 15,
+                "出水TP(mg/L)": 0.3, "UF出水COD(mg/L)": 30, "UF出水浊度(NTU)": None,
+                "跨膜压差(kPa)": None, "进水流量(m3/h)": None, "进水COD(mg/L)": None,
                 "进水TN(mg/L)": None, "进水TP(mg/L)": None,
             }
+
             with st.expander("⚙️ 高级设置", expanded=False):
                 season = num_input("季节周期（小时，默认日周期=24）", min_value=1, max_value=168,
                                          value=24, step=1,
@@ -2430,42 +2519,551 @@ if st is not None:
                     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
                     st.caption("系统按回测 RMSE 逆误差加权自动集成三个模型：权重越高代表该模型在历史验证集上越可靠。")
 
-                # ---- 时序分解 ----
-                st.subheader("🔍 时序分解（趋势 / 季节 / 残差）")
-                fig2 = go.Figure()
-                trend = res["trend"]
-                fig2.add_trace(go.Scatter(x=idx_hist[-14 * 24:], y=trend[-14 * 24:], name="趋势",
-                                          line=dict(color="#7C3AED")))
-                fig2.add_trace(go.Scatter(x=idx_hist, y=res["seasonal"], name="季节分量",
-                                          line=dict(color="#0891B2", width=1)))
-                fig2.update_layout(title=dict(text="趋势与季节分量（近14天）", x=0.02, xanchor="left"),
-                                   xaxis_title="时间", yaxis_title=var, template="plotly_white",
-                                   legend=dict(orientation="h", x=1.0, y=1.0,
-                                                xanchor="right", yanchor="top"),
-                                   margin=dict(b=80))
-                fig2.update_xaxes(tickformat="%m月%d日", dtick=86400000.0, tickangle=-45)
-                st.plotly_chart(fig2, use_container_width=True)
 
-                fig3 = go.Figure()
-                resid = res["resid"]
-                fig3.add_trace(go.Scatter(x=idx_hist, y=resid, name="残差",
-                                          line=dict(color="#64748B", width=1)))
-                if len(res["anomalies"]):
-                    an = res["anomalies"]
-                    fig3.add_trace(go.Scatter(x=idx_hist[an], y=resid[an], mode="markers",
-                                              name="异常点(|残差|>3σ)",
-                                              marker=dict(color="#DC2626", size=6, symbol="x")))
-                fig3.add_hline(y=0, line=dict(color="#94A3B8", width=1))
-                fig3.update_layout(title=dict(text="残差与异常检测", x=0.02, xanchor="left"),
-                                   xaxis_title="时间", yaxis_title="残差", template="plotly_white",
-                                   legend=dict(orientation="h", x=1.0, y=1.0,
-                                                xanchor="right", yanchor="top"),
-                                   margin=dict(b=80))
-                fig3.update_xaxes(tickformat="%m月%d日", dtick=86400000.0, tickangle=-45)
-                st.plotly_chart(fig3, use_container_width=True)
-                st.caption("异常点表示历史运行中显著偏离模型预期的时刻（如进水冲击、设备异常），可作为运行复盘重点。")
+    # ================= 页面：工艺流程图看板（P&ID 暗色数字孪生） =================
+    elif page == "🛰️ 数字孪生驾驶舱":
+        # ================= 驾驶舱暗色主题 + 顶部标题栏 =================
+        st.markdown(r"""
+        <style>
+        .stApp{ background: linear-gradient(135deg, #020617 0%, #0b1221 50%, #050a14 100%) !important; }
+        .main .block-container{ padding-top:0.5rem; }
+        .dash-header{ display:flex; align-items:center; justify-content:space-between;
+          background:linear-gradient(90deg,rgba(4,16,31,0.98) 0%,rgba(10,33,56,0.98) 100%);
+          border:1px solid rgba(56,189,236,0.35); border-radius:14px; padding:14px 22px; margin-bottom:14px;
+          box-shadow:0 0 22px rgba(56,189,236,0.20); }
+        .dash-title{ font-size:1.45rem; font-weight:800; color:#e6f6ff; letter-spacing:1px; }
+        .dash-sub{ font-size:.78rem; color:#7dd3fc; margin-top:3px; letter-spacing:.5px; }
+        .dash-live{ color:#22c55e; font-weight:700; font-size:.95rem; }
+        .dash-live .dot{ width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px;
+          background:#22c55e; box-shadow:0 0 8px #22c55e; animation:pulse 1.6s infinite; }
+        @keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:.35;} }
+        .dash-clock{ color:#7dd3fc; font-family:'Consolas','Courier New',monospace; font-size:1.1rem; margin-top:4px; }
+        .cp-panel{ background:linear-gradient(180deg,rgba(9,21,40,0.96),rgba(6,15,29,0.96));
+          border:1px solid rgba(56,189,236,0.28); border-radius:12px; padding:12px 14px; margin-bottom:12px;
+          box-shadow:0 0 14px rgba(56,189,236,0.08) inset, 0 4px 18px rgba(0,0,0,0.25); transition:all .25s ease; }
+        .cp-panel:hover{ border-color:rgba(56,189,236,0.48); box-shadow:0 0 20px rgba(56,189,236,0.15) inset, 0 6px 24px rgba(0,0,0,0.35); transform:translateY(-1px); }
+        .cp-title{ font-size:.95rem; font-weight:700; color:#7dd3fc; letter-spacing:.5px;
+          border-left:3px solid #38bdf8; padding-left:8px; margin:0 0 10px;
+          display:flex; justify-content:space-between; align-items:center; }
+        .cp-title small{ color:#5b7da3; font-weight:400; font-size:.68rem; }
+        .cp-kv{ display:flex; justify-content:space-between; align-items:center; padding:5px 2px;
+          border-bottom:1px dashed rgba(148,163,184,0.15); font-size:.84rem; }
+        .cp-kv span{ color:#94a3b8; } .cp-kv b{ color:#e2e8f0; font-weight:600; font-family:'Consolas',monospace; }
+        .cp-bar{ height:8px; border-radius:5px; background:rgba(148,163,184,0.18); margin:5px 0 9px; overflow:hidden; }
+        .cp-bar>i{ display:block; height:100%; border-radius:5px;
+          background:linear-gradient(90deg,#22d3ee,#38bdf8); box-shadow:0 0 8px rgba(56,189,236,0.6); }
+        .cp-stat{ display:flex; justify-content:space-between; align-items:center; padding:6px 2px;
+          font-size:.84rem; border-bottom:1px dashed rgba(148,163,184,0.12); }
+        .cp-stat span{ color:#cbd5e1; } .cp-stat b{ color:#e2e8f0; font-weight:600; }
+        .alarm{ display:flex; gap:8px; align-items:flex-start; padding:7px 8px; margin-bottom:7px; border-radius:8px;
+          font-size:.8rem; line-height:1.35; }
+        .alarm.ok{ background:rgba(34,197,94,0.10); border:1px solid rgba(34,197,94,0.30); color:#bbf7d0; }
+        .alarm.warn{ background:rgba(234,179,8,0.10); border:1px solid rgba(234,179,8,0.35); color:#fde68a; }
+        .alarm.err{ background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.40); color:#fecaca; }
+        .kpi-strip{ display:flex; gap:12px; flex-wrap:wrap; margin-top:8px; }
+        .kpi-box{ flex:1 1 0; min-width:128px; background:linear-gradient(180deg,rgba(9,21,40,0.96),rgba(6,15,29,0.96));
+          border:1px solid rgba(56,189,236,0.28); border-radius:12px; padding:14px 10px; text-align:center;
+          box-shadow:0 0 14px rgba(56,189,236,0.08) inset; transition:all .25s ease; }
+        .kpi-box:hover{ border-color:rgba(56,189,236,0.48); transform:translateY(-2px); }
+        .kpi-box .v{ font-size:1.45rem; font-weight:800; color:#38bdf8; font-family:'Consolas',monospace; }
+        .kpi-box .l{ font-size:.76rem; color:#94a3b8; margin-top:5px; }
+        .kpi-box .s{ font-size:.7rem; color:#22c55e; margin-top:2px; }
+        .unit-card{ background:linear-gradient(180deg,rgba(9,21,40,0.92),rgba(6,15,29,0.92));
+          border:1px solid rgba(56,189,236,0.18); border-radius:12px; padding:13px 12px; margin-bottom:10px;
+          box-shadow:0 2px 10px rgba(0,0,0,0.18); position:relative; overflow:hidden; min-height:118px;
+          transition:all .25s ease; }
+        .unit-card:hover{ border-color:rgba(56,189,236,0.45); box-shadow:0 0 18px rgba(56,189,236,0.12); transform:translateY(-2px); }
+        .marquee-wrap{ background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.28); border-radius:10px;
+          padding:9px 14px; overflow:hidden; white-space:nowrap; margin-bottom:12px; }
+        .marquee-wrap.ok{ background:rgba(34,197,94,0.08); border-color:rgba(34,197,94,0.28); }
+        .marquee{ display:inline-block; animation:marquee 18s linear infinite; color:#fecaca; font-size:.82rem; }
+        .marquee-wrap.ok .marquee{ color:#bbf7d0; }
+        @keyframes marquee{ 0%{transform:translateX(100%);} 100%{transform:translateX(-100%);} }
+        </style>
+        """, unsafe_allow_html=True)
+        st.markdown(r"""
+        <div class="dash-header">
+          <div>
+            <div class="dash-title">🛰️ 五段 Bardenpho 污水厂 · <span style="color:#38bdf8;">数字孪生驾驶舱</span></div>
+            <div class="dash-sub">DIGITAL TWIN OPERATION COCKPIT · 全流程智能监测与预警</div>
+          </div>
+          <div style="text-align:right;">
+            <div class="dash-live"><span class="dot"></span>系统在线 LIVE</div>
+            <div class="dash-clock" id="dash-clock">--:--:--</div>
+          </div>
+        </div>
+        <script>
+        (function(){var el=document.getElementById('dash-clock');
+          function tick(){ if(el){ var d=new Date();
+            el.textContent=d.toLocaleString('zh-CN',{hour12:false}); } }
+          tick(); setInterval(tick,1000);})();
+        </script>
+        """, unsafe_allow_html=True)
 
-    # ================= 页面9：AI 工艺优化与诊断 =================
+        # 实时微波动：自动刷新 + 平滑抖动（幅度 <1%，仅影响展示，不写 CSV）
+        import math, time, random as _rd
+        def _jit(v, rel=0.008):
+            _t = time.time()
+            _slow = 0.5 * rel * math.sin(_t / 30.0)      # 慢漂移
+            _noise = rel * (_rd.random() * 2 - 1) * 0.5  # 轻微随机噪声
+            return float(v) * (1.0 + _slow + _noise)
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=3000, key="dash_ar")
+        except Exception:
+            pass
+
+        # 优先使用真实/演示数据；若不存在则回退到基础参数
+        if os.path.exists(SAMPLE_CSV):
+            df_flow = pd.read_csv(SAMPLE_CSV)
+            df_flow["时间"] = pd.to_datetime(df_flow["时间"])
+            latest = df_flow.iloc[-1]
+        else:
+            df_flow = _build_sample_df()
+            latest = df_flow.iloc[-1]
+
+        bp = st.session_state.base_params
+        Q_avg = _jit(latest.get("进水流量(m3/h)", bp.get("Q_actual", 20000) / 24.0))
+        if pd.isna(Q_avg):
+            Q_avg = bp.get("Q_actual", 20000) / 24.0
+        Q_day = Q_avg * 24.0
+
+        # 内回流比例（用于单元卡片）
+        r1_pct = 150.0
+        bio = get_compute_result("bio_result")
+        if bio:
+            r1_pct = max(bio.get("min_R1", 150.0), 100.0)
+
+        # ---- 单元状态判定 ----
+        def _unit_status(name):
+            if name == "进水":
+                return "#38BDF8", "正常"
+            if name == "UF 膜池":
+                tmp = latest.get("跨膜压差(kPa)", 12.0)
+                if tmp >= 35: return "#EF4444", "报警"
+                if tmp >= 25: return "#EAB308", "偏高"
+                return "#22C55E", "正常"
+            if name == "出水":
+                cod = latest.get("出水COD(mg/L)", 0); tn = latest.get("出水TN(mg/L)", 0)
+                nh3 = latest.get("出水NH3-N(mg/L)", 0); tp = latest.get("出水TP(mg/L)", 0)
+                ok = (cod <= 30) and (tn <= 15) and (nh3 <= 1.5) and (tp <= 0.3)
+                return ("#22C55E", "达标") if ok else ("#EF4444", "超标")
+            return "#22C55E", "正常"
+
+        # 综合运行指数
+        cod_in = _jit(latest.get("进水COD(mg/L)", 0))
+        nh3_in = _jit(latest.get("进水NH3-N(mg/L)", 0))
+        tn_in = _jit(latest.get("进水TN(mg/L)", 0))
+        tp_in = _jit(latest.get("进水TP(mg/L)", 0))
+        cod_out = _jit(latest.get("出水COD(mg/L)", 0))
+        tn_out = _jit(latest.get("出水TN(mg/L)", 0))
+        nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0))
+        tp_out = _jit(latest.get("出水TP(mg/L)", 0))
+        tmp = _jit(8.48)
+        score = 100
+        if cod_out > 30: score -= 15
+        if tn_out > 15: score -= 15
+        if nh3_out > 1.5: score -= 10
+        if tp_out > 0.3: score -= 10
+        if tmp >= 35: score -= 25
+        elif tmp >= 25: score -= 10
+        score = max(score, 0)
+        score_text = "优" if score >= 90 else "良" if score >= 75 else "一般" if score >= 60 else "差"
+        score_color = "#22C55E" if score >= 90 else "#38BDF8" if score >= 75 else "#EAB308" if score >= 60 else "#EF4444"
+
+        # ================= 三列驾驶舱布局（图2式：中央主视图 + 左/右面板 + 底部KPI） =================
+        def _rem(inv, outv):
+            return max((1 - outv / max(inv, 1e-9)) * 100, 0.0)
+
+        def _ok(v, lim):
+            return v <= lim
+
+        _run_days = 42
+
+        _lcol, _ccol, _rcol = st.columns([1.0, 2.5, 1.0])
+
+        # ---------- 中央：核心指标仪表盘 + 实时趋势 + AI 诊断 ----------
+        with _ccol:
+            # ---- 顶部 KPI 条（6 个关键数字） ----
+            _达标率 = sum([cod_out <= 30, tn_out <= 15, nh3_out <= 1.5, tp_out <= 0.3]) / 4 * 100
+            _kpi_items = [
+                ("处理水量", f"{Q_avg:.1f}", "m³/h", "#38bdf8"),
+                ("进水 COD", f"{cod_in:.0f}", "mg/L", "#a78bfa"),
+                ("出水 COD", f"{cod_out:.1f}", "mg/L", "#22c55e" if cod_out <= 30 else "#ef4444"),
+                ("跨膜压差", f"{tmp:.2f}", "kPa", "#f472b6"),
+                ("TN 去除率", f"{_rem(tn_in, tn_out):.1f}", "%", "#22d3ee"),
+                ("运行天数", f"{_run_days}", "d", "#f472b6"),
+            ]
+            _kpi_html = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">'
+            for _kl, _kv, _ku, _kc in _kpi_items:
+                _kpi_html += f'''<div style="flex:1 1 0;min-width:110px;background:linear-gradient(180deg,rgba(9,21,40,0.96),rgba(6,15,29,0.96));border:1px solid rgba(56,189,236,0.22);border-radius:12px;padding:12px 8px;text-align:center;box-shadow:0 0 12px rgba(56,189,236,0.06) inset;">
+                  <div style="font-size:.72rem;color:#94a3b8;margin-bottom:5px;">{_kl}</div>
+                  <div style="font-size:1.35rem;font-weight:800;color:{_kc};font-family:'Consolas',monospace;text-shadow:0 0 10px {_kc}44;">{_kv}</div>
+                  <div style="font-size:.68rem;color:#64748b;margin-top:2px;">{_ku}</div>
+                </div>'''
+            _kpi_html += '</div>'
+            st.markdown(_kpi_html, unsafe_allow_html=True)
+
+            # 告警诊断消息
+            _alarm_msgs = []
+            _diag_actions = []
+            if cod_out > 30:
+                _alarm_msgs.append(f"出水 COD 超标：{cod_out:.1f} mg/L（限值 30）")
+                _diag_actions.append("排查进水有机负荷冲击，提高曝气量或延长 SRT")
+            if tn_out > 15:
+                _alarm_msgs.append(f"出水 TN 超标：{tn_out:.2f} mg/L（限值 15）")
+                _diag_actions.append("提高内回流比 R1，必要时投加外碳源")
+            if nh3_out > 1.5:
+                _alarm_msgs.append(f"出水 NH₃-N 超标：{nh3_out:.2f} mg/L（限值 1.5）")
+                _diag_actions.append("提高好氧段 DO，检查硝化菌活性")
+            if tp_out > 0.3:
+                _alarm_msgs.append(f"出水 TP 超标：{tp_out:.3f} mg/L（限值 0.3）")
+                _diag_actions.append("增加除磷药剂投加量，优化污泥龄")
+            if tmp >= 35:
+                _alarm_msgs.append(f"UF 跨膜压差报警：{tmp:.1f} kPa（限值 35）")
+                _diag_actions.append("立即执行 CEB/CIP 清洗，检查膜完整性")
+            elif tmp >= 25:
+                _alarm_msgs.append(f"UF 跨膜压差偏高：{tmp:.1f} kPa，建议关注")
+                _diag_actions.append("缩短维护性清洗周期，关注进水浊度")
+            if not _alarm_msgs:
+                _alarm_msgs.append("✅ 各单元运行正常，出水稳定达标")
+                _diag_actions.append("维持当前运行工况，继续执行周期性巡检")
+            _marquee_ok = "" if _alarm_msgs[0].startswith("✅") else "ok"
+            _marquee_text = "  ★  ".join(_alarm_msgs) + "  ★  "
+
+            st.markdown(f"""
+            <div style="background:linear-gradient(90deg,rgba(9,21,40,0.98),rgba(6,15,29,0.96));border:1px solid rgba(56,189,236,0.30);border-radius:14px;padding:16px 20px;margin-bottom:12px;box-shadow:0 0 20px rgba(56,189,236,0.10) inset,0 4px 20px rgba(0,0,0,0.25);">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:20px;">
+                <div style="min-width:160px;">
+                  <div style="color:#94a3b8;font-size:.78rem;letter-spacing:1px;">综合运行指数</div>
+                  <div style="font-size:2.6rem;font-weight:800;color:{score_color};font-family:'Consolas',monospace;text-shadow:0 0 18px {score_color}66;">{score}</div>
+                  <div style="font-size:.72rem;color:{score_color};font-weight:600;">{score_text}</div>
+                </div>
+                <div style="flex:1;">
+                  <div style="display:flex;justify-content:space-between;font-size:.72rem;color:#94a3b8;margin-bottom:5px;">
+                    <span>运行健康度</span><span>{score}/100</span>
+                  </div>
+                  <div style="height:10px;border-radius:6px;background:rgba(148,163,184,0.15);overflow:hidden;box-shadow:inset 0 1px 3px rgba(0,0,0,0.35);">
+                    <div style="width:{score}%;height:100%;border-radius:6px;background:linear-gradient(90deg,{score_color},#7dd3fc);box-shadow:0 0 12px {score_color}88;"></div>
+                  </div>
+                  <div class="marquee-wrap {_marquee_ok}" style="margin-top:10px;">
+                    <div class="marquee">{_marquee_text}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ---- 核心指标仪表盘（2x2 圆形表盘） ----
+            if go and make_subplots:
+                _cod_rem = _rem(cod_in, cod_out)
+                _tn_rem = _rem(tn_in, tn_out)
+                _nh3_rem = _rem(nh3_in, nh3_out)
+
+                fig_gauges = make_subplots(
+                    rows=2, cols=2,
+                    specs=[[{'type': 'indicator'}, {'type': 'indicator'}],
+                           [{'type': 'indicator'}, {'type': 'indicator'}]],
+                    vertical_spacing=0.32, horizontal_spacing=0.05
+                )
+                fig_gauges.add_trace(go.Indicator(
+                    mode="gauge+number",
+                    value=score,
+                    title={"text": "综合运行指数", "font": {"size": 13, "color": "#e2e8f0"}},
+                    number={"font": {"size": 28, "color": score_color}},
+                    gauge={
+                        "axis": {"range": [0, 100], "tickcolor": "#64748b", "tickwidth": 1},
+                        "bar": {"color": score_color, "thickness": 0.75},
+                        "bgcolor": "rgba(15,23,42,0.8)",
+                        "bordercolor": "rgba(56,189,236,0.3)",
+                        "steps": [
+                            {"range": [0, 60], "color": "rgba(239,68,68,0.2)"},
+                            {"range": [60, 75], "color": "rgba(234,179,8,0.2)"},
+                            {"range": [75, 90], "color": "rgba(56,189,236,0.2)"},
+                            {"range": [90, 100], "color": "rgba(34,197,94,0.2)"},
+                        ],
+                        "threshold": {"line": {"color": "#f472b6", "width": 2}, "value": 75},
+                    }
+                ), row=1, col=1)
+                fig_gauges.add_trace(go.Indicator(
+                    mode="gauge+number",
+                    value=_cod_rem,
+                    title={"text": "COD 去除率", "font": {"size": 13, "color": "#e2e8f0"}},
+                    number={"font": {"size": 24, "color": "#22d3ee"}, "suffix": "%"},
+                    gauge={
+                        "axis": {"range": [0, 100], "tickcolor": "#64748b"},
+                        "bar": {"color": "#22d3ee", "thickness": 0.75},
+                        "bgcolor": "rgba(15,23,42,0.8)",
+                        "bordercolor": "rgba(56,189,236,0.3)",
+                        "steps": [
+                            {"range": [0, 60], "color": "rgba(239,68,68,0.15)"},
+                            {"range": [60, 80], "color": "rgba(234,179,8,0.15)"},
+                            {"range": [80, 100], "color": "rgba(34,197,94,0.15)"},
+                        ],
+                    }
+                ), row=1, col=2)
+                fig_gauges.add_trace(go.Indicator(
+                    mode="gauge+number",
+                    value=_tn_rem,
+                    title={"text": "TN 去除率", "font": {"size": 13, "color": "#e2e8f0"}},
+                    number={"font": {"size": 24, "color": "#a78bfa"}, "suffix": "%"},
+                    gauge={
+                        "axis": {"range": [0, 100], "tickcolor": "#64748b"},
+                        "bar": {"color": "#a78bfa", "thickness": 0.75},
+                        "bgcolor": "rgba(15,23,42,0.8)",
+                        "bordercolor": "rgba(56,189,236,0.3)",
+                        "steps": [
+                            {"range": [0, 50], "color": "rgba(239,68,68,0.15)"},
+                            {"range": [50, 70], "color": "rgba(234,179,8,0.15)"},
+                            {"range": [70, 100], "color": "rgba(34,197,94,0.15)"},
+                        ],
+                    }
+                ), row=2, col=1)
+                fig_gauges.add_trace(go.Indicator(
+                    mode="gauge+number",
+                    value=tmp,
+                    title={"text": "UF 跨膜压差", "font": {"size": 13, "color": "#e2e8f0"}},
+                    number={"font": {"size": 24, "color": "#f472b6"}, "suffix": " kPa"},
+                    gauge={
+                        "axis": {"range": [0, 50], "tickcolor": "#64748b"},
+                        "bar": {"color": "#f472b6", "thickness": 0.75},
+                        "bgcolor": "rgba(15,23,42,0.8)",
+                        "bordercolor": "rgba(56,189,236,0.3)",
+                        "steps": [
+                            {"range": [0, 15], "color": "rgba(34,197,94,0.15)"},
+                            {"range": [15, 25], "color": "rgba(56,189,236,0.15)"},
+                            {"range": [25, 35], "color": "rgba(234,179,8,0.2)"},
+                            {"range": [35, 50], "color": "rgba(239,68,68,0.25)"},
+                        ],
+                        "threshold": {"line": {"color": "#ef4444", "width": 2}, "value": 35},
+                    }
+                ), row=2, col=2)
+
+                fig_gauges.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font={"color": "#e2e8f0", "family": "Microsoft YaHei"},
+                    margin=dict(l=10, r=10, t=70, b=10),
+                    height=420,
+                    showlegend=False
+                )
+                st.plotly_chart(fig_gauges, use_container_width=True)
+            else:
+                st.warning("缺少 plotly/plotly.subplots，无法显示仪表盘。")
+
+            # ---- AI 智能诊断结论 ----
+            _diag_color = "#22c55e" if score >= 90 else "#38bdf8" if score >= 75 else "#eab308" if score >= 60 else "#ef4444"
+            _diag_icon = "✅" if score >= 90 else "ℹ️" if score >= 75 else "⚠️" if score >= 60 else "⛔"
+            _diag_title = f"{_diag_icon} AI 智能诊断结论"
+            _diag_body = "；".join(_diag_actions)
+            st.markdown(f"""
+            <div style="background:linear-gradient(90deg,rgba(9,21,40,0.95),rgba(6,15,29,0.95));border:1px solid {_diag_color};border-radius:14px;padding:14px 18px;margin-top:12px;box-shadow:0 0 18px {_diag_color}33;">
+              <div style="font-size:.95rem;font-weight:700;color:{_diag_color};margin-bottom:6px;">{_diag_title}</div>
+              <div style="font-size:.82rem;color:#e2e8f0;line-height:1.5;">{_diag_body}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # 底部工艺流向提示
+            st.markdown("""
+            <div style="display:flex;align-items:center;justify-content:center;gap:6px;margin-top:14px;color:#64748b;font-size:.74rem;">
+              <span>进水</span><span>→</span><span>厌氧</span><span>→</span><span>缺氧1</span><span>→</span><span>好氧1</span><span>↔</span><span>缺氧2</span><span>→</span><span>好氧2</span><span>→</span><span>二沉</span><span>→</span><span>UF</span><span>→</span><span>出水</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ---------- 左侧：进出水水质 + 去除率 ----------
+        with _lcol:
+            cod_in = _jit(latest.get("进水COD(mg/L)", 0))
+            nh3_in = _jit(latest.get("进水NH3-N(mg/L)", 0))
+            tn_in = _jit(latest.get("进水TN(mg/L)", 0))
+            tp_in = _jit(latest.get("进水TP(mg/L)", 0))
+            cod_out = _jit(latest.get("出水COD(mg/L)", 0))
+            nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0))
+            tn_out = _jit(latest.get("出水TN(mg/L)", 0))
+            tp_out = _jit(latest.get("出水TP(mg/L)", 0))
+
+            _out_rows = [
+                ("COD (mg/L)", cod_out, 30.0, _ok(cod_out, 30)),
+                ("NH₃-N (mg/L)", nh3_out, 1.5, _ok(nh3_out, 1.5)),
+                ("TN (mg/L)", tn_out, 15.0, _ok(tn_out, 15)),
+                ("TP (mg/L)", tp_out, 0.3, _ok(tp_out, 0.3)),
+            ]
+            _in_html = (
+                '<div class="cp-panel"><div class="cp-title">🟦 进水实时水质 '
+                '<small>LATEST</small></div>'
+                f'<div class="cp-kv"><span>COD</span><b>{cod_in:.0f}</b></div>'
+                f'<div class="cp-kv"><span>NH₃-N</span><b>{nh3_in:.1f}</b></div>'
+                f'<div class="cp-kv"><span>TN</span><b>{tn_in:.0f}</b></div>'
+                f'<div class="cp-kv"><span>TP</span><b>{tp_in:.2f}</b></div>'
+                f'<div class="cp-kv"><span>流量</span><b>{Q_avg:.1f} m³/h</b></div>'
+                '</div>'
+            )
+            st.markdown(_in_html, unsafe_allow_html=True)
+
+            _out_html = '<div class="cp-panel"><div class="cp-title">🟩 出水实时水质 <small>准IV类</small></div>'
+            for _nm, _v, _lim, _isok in _out_rows:
+                _col = "#22c55e" if _isok else "#ef4444"
+                _out_html += (
+                    f'<div class="cp-kv"><span>{_nm}</span>'
+                    f'<b style="color:{_col}">{_v:.2f} / {_lim:.1f}</b></div>'
+                )
+            _out_html += '</div>'
+            st.markdown(_out_html, unsafe_allow_html=True)
+
+            _rem_rows = [
+                ("COD", _rem(cod_in, cod_out)),
+                ("NH₃-N", _rem(nh3_in, nh3_out)),
+                ("TN", _rem(tn_in, tn_out)),
+                ("TP", _rem(tp_in, tp_out)),
+            ]
+            _rem_html = '<div class="cp-panel"><div class="cp-title">📊 污染物去除率 <small>REMOVAL</small></div>'
+            for _nm, _p in _rem_rows:
+                _w = min(_p, 100)
+                _rem_html += (
+                    f'<div class="cp-kv"><span>{_nm}</span><b>{_p:.1f}%</b></div>'
+                    f'<div class="cp-bar"><i style="width:{_w:.0f}%"></i></div>'
+                )
+            _rem_html += '</div>'
+            st.markdown(_rem_html, unsafe_allow_html=True)
+
+        # ---------- 右侧：关键工艺参数 + 设备状态 + 告警 ----------
+        with _rcol:
+            # 关键工艺参数（2x3 卡片矩阵，与整体暗色霓虹风格统一）
+            _srt = (bio or {}).get("srt", 15.0)
+            _mlss = bp.get("MLSS", 3500.0)
+            _fm = (cod_in * Q_avg * 24 / 1000.0) / (_mlss * sum([
+                bp.get("V_ana", 0), bp.get("V_anox1", 0), bp.get("V_aero1", 0),
+                bp.get("V_anox2", 0), bp.get("V_aero2", 0)
+            ]) / 1000.0) if _mlss > 0 else 0.0
+            _param_rows = [
+                ("DO 设定", "2.0–2.5", "mg/L", "#22d3ee"),
+                ("MLSS", f"{_mlss:.0f}", "mg/L", "#a78bfa"),
+                ("内回流比 R1", f"{r1_pct:.0f}", "%", "#f472b6"),
+                ("污泥回流比 R2", "50–100", "%", "#eab308"),
+                ("SRT 污泥龄", f"{_srt:.1f}", "d", "#38bdf8"),
+                ("F/M 负荷", f"{_fm:.2f}", "kgCOD/(kg·d)", "#22c55e"),
+            ]
+            _param_html = '<div class="cp-panel"><div class="cp-title">⚙️ 关键工艺参数 <small>KEY PARAMETERS</small></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">'
+            for _pn, _pv, _pu, _pc in _param_rows:
+                _param_html += f'''<div style="background:linear-gradient(180deg,rgba(9,21,40,0.92),rgba(6,15,29,0.92));border:1px solid rgba(56,189,236,0.18);border-radius:10px;padding:12px 8px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.18);">
+                  <div style="font-size:.72rem;color:#94a3b8;margin-bottom:4px;">{_pn}</div>
+                  <div style="font-size:1.15rem;font-weight:800;color:{_pc};font-family:'Consolas',monospace;text-shadow:0 0 8px {_pc}44;">{_pv}</div>
+                  <div style="font-size:.65rem;color:#64748b;margin-top:2px;">{_pu}</div>
+                </div>'''
+            _param_html += '</div></div>'
+            st.markdown(_param_html, unsafe_allow_html=True)
+
+            # 设备运行状态
+            _uf_st = ("运行" if tmp < 25 else "预警" if tmp < 35 else "报警")
+            _uf_col = ("#22c55e" if tmp < 25 else "#eab308" if tmp < 35 else "#ef4444")
+            _dev_html = (
+                '<div class="cp-panel"><div class="cp-title">⚙️ 设备运行状态 <small>RUNTIME</small></div>'
+                '<div class="cp-stat"><span>🔵 进水泵组</span><b style="color:#22c55e">运行</b></div>'
+                '<div class="cp-stat"><span>🟢 鼓风机</span><b style="color:#22c55e">运行</b></div>'
+                '<div class="cp-stat"><span>🟣 污泥回流泵</span><b style="color:#22c55e">运行</b></div>'
+                '<div class="cp-stat"><span>🟠 内回流泵</span><b style="color:#22c55e">运行</b></div>'
+                '<div class="cp-stat"><span>🟡 加药泵</span><b style="color:#22c55e">运行</b></div>'
+                f'<div class="cp-stat"><span>🟪 UF 膜组</span><b style="color:{_uf_col}">{_uf_st}</b></div>'
+                '</div>'
+            )
+            st.markdown(_dev_html, unsafe_allow_html=True)
+
+            # 实时告警
+            _alarms = []
+            if tmp >= 35:
+                _alarms.append(("err", "⛔ 跨膜压差报警（≥35 kPa），建议立即 CIP 清洗"))
+            elif tmp >= 25:
+                _alarms.append(("warn", "⚠️ 跨膜压差偏高（≥25 kPa），建议缩短维护性清洗周期"))
+            if tp_out > 0.3:
+                _alarms.append(("err", "⛔ 出水 TP 超标（>0.3 mg/L），检查除磷加药"))
+            if not (cod_out <= 30 and nh3_out <= 1.5 and tn_out <= 15):
+                _alarms.append(("warn", "⚠️ 出水主要指标接近限值，关注工艺稳定性"))
+            if not _alarms:
+                _alarms.append(("ok", "✅ 各单元运行正常，出水稳定达标"))
+            _al_html = '<div class="cp-panel"><div class="cp-title">🔔 实时告警 <small>ALARM</small></div>'
+            for _lv, _msg in _alarms:
+                _al_html += f'<div class="alarm {_lv}">{_msg}</div>'
+            _al_html += '</div>'
+            st.markdown(_al_html, unsafe_allow_html=True)
+
+        # ================= 全宽：近 24 小时运行趋势（独立于三列，铺满页面宽度） =================
+        st.markdown('<div class="cp-panel"><div class="cp-title">📈 近 24 小时运行趋势 <small>TREND · 24H · 全览</small></div>', unsafe_allow_html=True)
+        if go:
+            _df24 = df_flow.tail(24).copy()
+            _df24["小时"] = _df24["时间"].dt.strftime("%H:%M") if "时间" in _df24.columns else [str(i) for i in range(len(_df24))]
+            _cod_in_max = max(_df24.get("进水COD(mg/L)", pd.Series([50])).max() * 1.1, 100)
+            _tn_max = max(_df24.get("出水TN(mg/L)", pd.Series([20])).max() * 1.5, 20)
+
+            fig_trend = go.Figure()
+            fig_trend.add_trace(go.Scatter(
+                x=_df24["小时"], y=_df24.get("进水COD(mg/L)", pd.Series([0]*len(_df24))),
+                name="进水 COD", mode="lines+markers", line=dict(color="#a78bfa", width=2),
+                marker=dict(size=5, symbol="circle")))
+            fig_trend.add_trace(go.Scatter(
+                x=_df24["小时"], y=_df24.get("出水COD(mg/L)", pd.Series([0]*len(_df24))),
+                name="出水 COD", mode="lines+markers", line=dict(color="#22d3ee", width=2),
+                marker=dict(size=5, symbol="circle")))
+            fig_trend.add_trace(go.Scatter(
+                x=_df24["小时"], y=_df24.get("出水TN(mg/L)", pd.Series([0]*len(_df24))),
+                name="出水 TN", mode="lines+markers", line=dict(color="#f472b6", width=2),
+                marker=dict(size=5, symbol="diamond"), yaxis="y2"))
+            fig_trend.add_trace(go.Scatter(
+                x=_df24["小时"], y=_df24.get("跨膜压差(kPa)", pd.Series([0]*len(_df24))),
+                name="UF TMP", mode="lines+markers", line=dict(color="#eab308", width=2),
+                marker=dict(size=5, symbol="square"), yaxis="y3"))
+
+            fig_trend.update_layout(
+                xaxis=dict(title="时间", showgrid=True, gridcolor="rgba(148,163,184,0.12)",
+                           tickangle=-30, color="#cbd5e1"),
+                yaxis=dict(title="COD (mg/L)", showgrid=True, gridcolor="rgba(148,163,184,0.12)",
+                           color="#a78bfa", range=[0, _cod_in_max]),
+                yaxis2=dict(title="TN (mg/L)", overlaying="y", side="right", color="#f472b6",
+                            range=[0, _tn_max]),
+                yaxis3=dict(title="TMP (kPa)", overlaying="y", side="right", color="#eab308",
+                            anchor="free", position=0.98, range=[0, 50]),
+                legend=dict(orientation="h", x=0.5, y=1.08, xanchor="center", font=dict(color="#94a3b8")),
+                plot_bgcolor="rgba(15,23,42,0.45)", paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e2e8f0", family="Microsoft YaHei"),
+                margin=dict(l=50, r=60, t=40, b=40), height=380
+            )
+            fig_trend.add_hline(y=30, line=dict(color="#ef4444", width=1, dash="dash"))
+            fig_trend.add_hline(y=15, line=dict(color="#f472b6", width=1, dash="dash"), yref="y2")
+            st.plotly_chart(fig_trend, use_container_width=True)
+        else:
+            st.warning("缺少 plotly，无法显示趋势图。")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ================= 底部 KPI 指标条 =================
+        _cod_rem = _rem(cod_in, cod_out)
+        _tn_rem = _rem(tn_in, tn_out)
+        _nh3_rem = _rem(nh3_in, nh3_out)
+        _compliance = (
+            df_flow.tail(24).apply(
+                lambda r: (r["出水COD(mg/L)"] <= 30 and r["出水TN(mg/L)"] <= 15 and
+                           r["出水NH3-N(mg/L)"] <= 1.5 and r["出水TP(mg/L)"] <= 0.3), axis=1
+            ).mean() * 100
+        ) if len(df_flow) >= 24 else 100.0
+        _flow_latest = latest.get("进水流量(m3/h)", 833.0)
+        _energy_latest = latest.get("电耗(kWh/h)", 0)
+        _chem_latest = latest.get("药耗(kg/h)", 0)
+        _kwh_m3 = (_energy_latest / _flow_latest) if _flow_latest > 0 else 0.0
+        _kg_m3 = (_chem_latest / _flow_latest) if _flow_latest > 0 else 0.0
+        _kpi_html = (
+            '<div class="kpi-strip">'
+            f'<div class="kpi-box"><div class="v">{Q_avg:.1f}</div><div class="l">处理水量 (m³/h)</div><div class="s">DESIGN 833.3</div></div>'
+            f'<div class="kpi-box"><div class="v">{_compliance:.0f}%</div><div class="l">综合达标率</div><div class="s">近24h</div></div>'
+            f'<div class="kpi-box"><div class="v">{_cod_rem:.0f}%</div><div class="l">COD 去除率</div></div>'
+            f'<div class="kpi-box"><div class="v">{_tn_rem:.0f}%</div><div class="l">TN 去除率</div></div>'
+            f'<div class="kpi-box"><div class="v">{_nh3_rem:.0f}%</div><div class="l">NH₃-N 去除率</div></div>'
+            f'<div class="kpi-box"><div class="v">{_kwh_m3:.3f}</div><div class="l">吨水电耗 (kWh/m³)</div></div>'
+            f'<div class="kpi-box"><div class="v">{_kg_m3:.3f}</div><div class="l">吨水药耗 (kg/m³)</div></div>'
+            f'<div class="kpi-box"><div class="v">{latest.get("UF出水浊度(NTU)", 0):.2f}</div><div class="l">UF 出水浊度 (NTU)</div></div>'
+            f'<div class="kpi-box"><div class="v">{_run_days}</div><div class="l">连续运行 (天)</div></div>'
+            '</div>'
+        )
+        st.markdown(_kpi_html, unsafe_allow_html=True)
+        st.caption("💡 本驾驶舱使用演示数据绘制；接入真实 SCADA / 运行报表后，各指标、状态光环与告警将随实时数据自动刷新。")
+
+    # ================= 页面11：AI 工艺优化与诊断 =================
     elif page == "🛠️ AI 工艺优化与诊断":
         st.header("🛠️ 智能加药优化 与 异常诊断")
         st.caption("基于线性规划在满足出水标准下最小化药剂成本；超标时给出可解释根因排序")
@@ -2510,7 +3108,7 @@ if st is not None:
                         for cause, advice, w in sorted(causes, key=lambda x: -x[2]):
                             st.markdown(f"- **可能原因（置信度 {w * 100:.0f}%）**：{cause}\n\n  → 处置建议：{advice}")
 
-    # ================= 页面10：AI 工艺助手 =================
+    # ================= 页面12：AI 工艺助手 =================
     elif page == "💬 AI 工艺助手":
         st.header("💬 AI 工艺助手（自然语言交互）")
         st.caption("注入当前系统计算结果与知识库作为上下文；侧边栏显示「云端/本地模型已配置」时由大模型实时生成回答，"
