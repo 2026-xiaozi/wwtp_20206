@@ -2581,7 +2581,7 @@ if st is not None:
         @keyframes marquee{ 0%{transform:translateX(100%);} 100%{transform:translateX(-100%);} }
         </style>
         """, unsafe_allow_html=True)
-        _now_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        _now_str = pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d %H:%M:%S")
         st.markdown(f"""
         <div class="dash-header">
           <div>
