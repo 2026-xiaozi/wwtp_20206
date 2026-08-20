@@ -387,6 +387,7 @@ def validate_base_params(bp):
 def find_kb_dir():
     """查找知识库目录（可选 RAG 增强）。找不到则返回 None，由规则引擎兜底。"""
     cands = [
+        os.path.join(SCRIPT_DIR, "kb"),
         r"D:\应用软件\WorkBuddy\Knowledge_Base",
         os.path.expanduser("~/Knowledge_Base"),
         os.path.join(os.path.dirname(SCRIPT_DIR), "Knowledge_Base"),
@@ -451,8 +452,8 @@ def _rule_reply(q, ctx):
         ("成本与优化", {
             "成本": 3, "费用": 3, "药耗": 3, "电费": 2, "优化": 2, "节约": 2,
             "药剂": 2, "能耗": 2, "曝气": 2, "省钱": 3, "运行费": 2, "降本": 3,
-        }, "【成本建议】可在『AI 工艺优化与诊断』页运行『一键优化投加方案』，在满足出水标准下"
-           "最小化药剂成本；曝气能耗可通过优化 DO 设定与精确曝气进一步降低。"),
+        }, "【成本建议】可在『成本经济核算-药剂成本』页查看『药剂成本优化方案』，由线性规划在可选药剂中"
+           "自动挑选最省组合以最小化药剂成本；曝气能耗可通过优化 DO 设定与精确曝气进一步降低。"),
         ("污泥与泥龄", {
             "污泥": 3, "泥龄": 3, "srt": 3, "排泥": 2, "mlss": 2, "硝化": 2,
             "沉降": 1, "二沉": 1, "剩余污泥": 2, "跑泥": 2, "浮泥": 2,
@@ -981,7 +982,7 @@ def export_pdf_report(bp, bio, cost):
 
 if st is not None:
     st.set_page_config(
-        page_title="五段Bardenpho污水厂运维管理系统",
+        page_title="CoreMate 污水厂智慧运维平台",
         layout="wide",
         initial_sidebar_state="expanded"
     )
@@ -1098,55 +1099,168 @@ if st is not None:
         # —— 登录页专属样式：美化表单，不隐藏全局侧边栏/顶栏 ——
         st.markdown(r"""
         <style>
+        /* 登录页：深海科技蓝动态背景（仅在未登录分支注入，登录后自动移除） */
+        .stApp{ background: linear-gradient(180deg,#071c33 0%,#0A2540 45%,#0e3a61 100%) !important; }
+        /* 深海光斑（缓慢浮动，模拟水下光线） */
+        .glow{ position:fixed; border-radius:50%; filter:blur(70px); pointer-events:none; z-index:0; }
+        .g1{ width:440px; height:440px; background:rgba(14,165,233,0.16); top:-100px; right:-80px;
+            animation:drift 20s ease-in-out infinite alternate; }
+        .g2{ width:380px; height:380px; background:rgba(83,74,183,0.20); bottom:-120px; left:-80px;
+            animation:drift 26s ease-in-out infinite alternate-reverse; }
+        @keyframes drift{ 0%{transform:translate(0,0) scale(1);} 100%{transform:translate(-70px,50px) scale(1.18);} }
+        /* 底部波浪层 */
+        .wave-bg{ position:fixed; left:0; bottom:0; width:100%; height:38vh; z-index:0; pointer-events:none; }
+        .wave-bg svg{ position:absolute; left:0; bottom:0; width:200%; height:100%; }
+        .wave-bg path{ fill:rgba(24,95,165,0.30); }
+        .wave1{ animation:waveMove 16s linear infinite; }
+        .wave2{ animation:waveMove 22s linear infinite reverse; opacity:0.7; }
+        .wave3{ animation:waveMove 28s linear infinite; opacity:0.5; }
+        @keyframes waveMove{ 0%{transform:translateX(0);} 100%{transform:translateX(-50%);} }
+        /* 漂浮粒子（气泡感） */
+        .particles{ position:fixed; inset:0; z-index:0; pointer-events:none; overflow:hidden; }
+        .particles span{ position:absolute; bottom:-10px; width:5px; height:5px; border-radius:50%;
+            background:rgba(133,183,235,0.55); filter:blur(1px);
+            animation:rise linear infinite; }
+        @keyframes rise{
+            0%{transform:translateY(0) translateX(0) scale(1); opacity:0;}
+            15%{opacity:0.8;}
+            100%{transform:translateY(-110vh) translateX(25px) scale(0.35); opacity:0;}
+        }
+        /* 表单元素宽度限制 */
+        #login-scope ~ .element-container [data-testid="stForm"]{ max-width:320px; margin:0 auto; }
         #login-scope ~ .element-container [data-testid="stTextInput"]{ max-width:320px; margin:0 auto; }
-        #login-scope ~ .element-container [data-testid="stButton"]{ max-width:320px; margin:14px auto 0; }
-        #login-scope ~ .element-container [data-testid="stTextInput"] input{
-            border-radius:10px; border:1.5px solid #cbd5e1; padding:11px 14px; font-size:1rem;
+        #login-scope ~ .element-container [data-testid="stTextInput"] input,
+        #login-scope ~ .element-container input[type="password"]{
+            background:rgba(255,255,255,0.95); color:#0f172a;
+            border-radius:10px; border:1.5px solid rgba(24,95,165,0.45);
+            padding:11px 14px; font-size:1rem; transition:border-color .15s, box-shadow .15s;
         }
-        #login-scope ~ .element-container [data-testid="stTextInput"] input:focus{
-            border-color:#0e7490; box-shadow:0 0 0 3px rgba(14,116,144,0.15);
+        #login-scope ~ .element-container [data-testid="stTextInput"] input::placeholder,
+        #login-scope ~ .element-container input[type="password"]::placeholder{ color:#94a3b8; }
+        #login-scope ~ .element-container [data-testid="stTextInput"] input:focus,
+        #login-scope ~ .element-container input[type="password"]:focus{
+            border-color:#185FA5; box-shadow:0 0 0 3px rgba(24,95,165,0.22);
         }
-        .login-card{ max-width:480px; margin:6vh auto 2vh; text-align:center;
-            background:rgba(255,255,255,0.92); backdrop-filter:blur(8px);
-            border:1px solid rgba(255,255,255,0.6); border-radius:20px;
-            padding:40px 34px; box-shadow:0 24px 60px rgba(15,23,42,0.20); }
-        .login-logo{ width:74px;height:74px;border-radius:50%;margin:0 auto 18px;
-            display:flex;align-items:center;justify-content:center;font-size:34px;
-            background:linear-gradient(135deg,#0e7490,#14b8a6);
-            box-shadow:0 10px 26px rgba(14,116,144,0.35); }
-        .login-title{ font-size:1.55rem;font-weight:800;color:#0f3043;line-height:1.45; }
-        .login-en{ margin-top:10px;font-size:.72rem;letter-spacing:2px;color:#64748b;
+        /* 登录按钮：多 selector 兼容不同 Streamlit 版本 */
+        #login-scope ~ .element-container button[kind="primaryFormSubmit"],
+        #login-scope ~ .element-container button[kind="primary"],
+        #login-scope ~ .element-container [data-testid="stFormSubmitButton"],
+        #login-scope ~ .element-container [data-testid="stFormSubmitButton"] button{
+            background:#185FA5 !important;
+            color:#fff !important; border:none !important; border-radius:10px !important;
+            font-weight:800 !important; letter-spacing:3px !important;
+            box-shadow:0 10px 24px rgba(24,95,165,0.45) !important;
+            transition:transform .15s ease, box-shadow .15s ease !important;
+            padding:0.6rem 1rem !important; width:100% !important;
+        }
+        #login-scope ~ .element-container button[kind="primaryFormSubmit"]:hover,
+        #login-scope ~ .element-container button[kind="primary"]:hover,
+        #login-scope ~ .element-container [data-testid="stFormSubmitButton"]:hover,
+        #login-scope ~ .element-container [data-testid="stFormSubmitButton"] button:hover{
+            transform:translateY(-2px) !important;
+            box-shadow:0 14px 30px rgba(24,95,165,0.6) !important;
+        }
+        .login-card{ position:relative; z-index:1; max-width:480px; margin:8vh auto 2vh; text-align:center;
+            background:rgba(255,255,255,0.88); backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px);
+            border:1px solid rgba(24,95,165,0.35); border-radius:20px;
+            padding:42px 34px;
+            box-shadow:0 24px 60px rgba(2,12,27,0.55), 0 0 24px rgba(24,95,165,0.18) inset; }
+        .login-logo{ width:80px;height:80px;border-radius:50%;margin:0 auto 18px;
+            display:flex;align-items:center;justify-content:center;
+            background:rgba(255,255,255,0.95);
+            border:1px solid rgba(24,95,165,0.40);
+            box-shadow:0 10px 28px rgba(24,95,165,0.35); }
+        .login-logo-svg{ width:50px; height:50px; }
+        .ripple{ transform-origin:center; animation:ripplePulse 2.4s ease-out infinite; opacity:0; }
+        .r1{ animation-delay:0s; } .r2{ animation-delay:0.8s; } .r3{ animation-delay:1.6s; }
+        @keyframes ripplePulse{ 0%{transform:scale(0.7); opacity:0.6;} 100%{transform:scale(1.15); opacity:0;} }
+        .login-drop{ transform-origin:50% 55%; animation:dropBreath 3.2s ease-in-out infinite; }
+        @keyframes dropBreath{ 0%,100%{transform:scale(1);} 50%{transform:scale(1.07);} }
+        .login-title{ font-size:2.5rem;font-weight:800;color:#0f172a;letter-spacing:1px; line-height:1.3; }
+        .login-sub{ margin-top:8px;font-size:1.0rem;font-weight:600;color:#0C447C; }
+        .login-en{ margin-top:8px;font-size:.7rem;letter-spacing:3px;color:#64748b;
             text-transform:uppercase; }
-        .login-divider{ width:64px;height:3px;border-radius:2px;margin:20px auto;
-            background:linear-gradient(90deg,#0e7490,#14b8a6); }
-        .login-tip{ color:#475569;font-size:.95rem; }
+        .login-divider{ width:72px;height:3px;border-radius:2px;margin:20px auto;
+            background:linear-gradient(90deg,#185FA5,#534AB7); }
+        .login-tip{ color:#7c8ba1;font-size:.8rem;font-weight:400; }
         </style>
+        <div class="glow g1"></div>
+        <div class="glow g2"></div>
+        <div class="wave-bg">
+            <svg viewBox="0 0 1440 320" preserveAspectRatio="none" class="wave1">
+                <path d="M0,160L48,176C96,192,192,224,288,224C384,224,480,192,576,170.7C672,149,768,139,864,154.7C960,171,1056,213,1152,218.7C1248,224,1344,192,1392,176L1440,160L1440,320L1392,320C1344,320,1248,320,1152,320C1056,320,960,320,864,320C768,320,672,320,576,320C480,320,384,320,288,320C192,320,96,320,48,320L0,320Z"></path>
+            </svg>
+            <svg viewBox="0 0 1440 320" preserveAspectRatio="none" class="wave2">
+                <path d="M0,224L48,213.3C96,203,192,181,288,181.3C384,181,480,203,576,224C672,245,768,267,864,250.7C960,235,1056,181,1152,165.3C1248,149,1344,171,1392,181.3L1440,192L1440,320L1392,320C1344,320,1248,320,1152,320C1056,320,960,320,864,320C768,320,672,320,576,320C480,320,384,320,288,320C192,320,96,320,48,320L0,320Z"></path>
+            </svg>
+            <svg viewBox="0 0 1440 320" preserveAspectRatio="none" class="wave3">
+                <path d="M0,96L48,117.3C96,139,192,181,288,186.7C384,192,480,160,576,149.3C672,139,768,149,864,165.3C960,181,1056,203,1152,197.3C1248,192,1344,160,1392,149.3L1440,138.7L1440,320L1392,320C1344,320,1248,320,1152,320C1056,320,960,320,864,320C768,320,672,320,576,320C480,320,384,320,288,320C192,320,96,320,48,320L0,320Z"></path>
+            </svg>
+        </div>
+        <div class="particles">
+            <span style="left:8%;animation-duration:11s;animation-delay:0s"></span>
+            <span style="left:18%;animation-duration:14s;animation-delay:1.2s"></span>
+            <span style="left:28%;animation-duration:12s;animation-delay:2.5s"></span>
+            <span style="left:38%;animation-duration:16s;animation-delay:0.8s"></span>
+            <span style="left:48%;animation-duration:13s;animation-delay:3.2s"></span>
+            <span style="left:58%;animation-duration:15s;animation-delay:1.8s"></span>
+            <span style="left:68%;animation-duration:10s;animation-delay:4.0s"></span>
+            <span style="left:78%;animation-duration:17s;animation-delay:2.2s"></span>
+            <span style="left:88%;animation-duration:12s;animation-delay:0.4s"></span>
+            <span style="left:95%;animation-duration:14s;animation-delay:3.8s"></span>
+            <span style="left:12%;animation-duration:18s;animation-delay:5.0s"></span>
+            <span style="left:22%;animation-duration:13s;animation-delay:2.0s"></span>
+            <span style="left:35%;animation-duration:16s;animation-delay:4.5s"></span>
+            <span style="left:52%;animation-duration:11s;animation-delay:1.0s"></span>
+            <span style="left:65%;animation-duration:15s;animation-delay:3.0s"></span>
+            <span style="left:82%;animation-duration:12s;animation-delay:5.5s"></span>
+        </div>
         <div id="login-scope"></div>
         <div class="login-card">
-            <div class="login-logo">💧</div>
-            <div class="login-title">五段Bardenpho污水厂<br>智能运维管理系统</div>
-            <div class="login-en">Five-Stage Bardenpho WWTP O&amp;M Platform</div>
+            <div class="login-logo">
+                <svg viewBox="0 0 100 100" class="login-logo-svg">
+                    <defs>
+                        <linearGradient id="dropGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" stop-color="#378ADD"/>
+                            <stop offset="100%" stop-color="#185FA5"/>
+                        </linearGradient>
+                    </defs>
+                    <circle class="ripple r1" cx="50" cy="55" r="28" fill="none" stroke="url(#dropGrad)" stroke-width="2"/>
+                    <circle class="ripple r2" cx="50" cy="55" r="38" fill="none" stroke="url(#dropGrad)" stroke-width="1.6"/>
+                    <circle class="ripple r3" cx="50" cy="55" r="48" fill="none" stroke="url(#dropGrad)" stroke-width="1.2"/>
+                    <g class="login-drop">
+                        <path d="M50 22 C50 22, 32 42, 32 56 C32 69, 40 80, 50 80 C60 80, 68 69, 68 56 C68 42, 50 22, 50 22 Z" fill="url(#dropGrad)"/>
+                        <path d="M42 46 C44 40, 47 37, 50 35 C48 41, 46 44, 42 46 Z" fill="#ffffff" opacity="0.65"/>
+                    </g>
+                </svg>
+            </div>
+            <div class="login-title">CoreMate</div>
+            <div class="login-sub">基于五段 Bardenpho + AI 的污水厂智慧运维平台</div>
+            <div class="login-en">AI-Driven WWTP Intelligent O&amp;M Platform</div>
             <div class="login-divider"></div>
-            <div class="login-tip">请输入访问密码以进入系统</div>
+            <div class="login-tip">AI驱动 · 成本优化 · 数字孪生</div>
         </div>
         """, unsafe_allow_html=True)
 
         col1, col2, col3 = st.columns([1, 1.6, 1])
         with col2:
-            input_pwd = st.text_input("访问密码", type="password",
-                                      placeholder="请输入访问密码", help="默认密码：123456")
-            if st.button("登 录 系 统", type="primary", use_container_width=True):
-                # 从平台后台读取正确密码（本地无 secrets.toml 时自动回退默认密码）
-                try:
-                    correct_pwd = st.secrets["access_password"]
-                except Exception:
-                    correct_pwd = "123456"
-                if input_pwd == correct_pwd:
-                    st.session_state.logged_in = True
-                    st.success("登录成功，正在进入系统...")
-                    st.rerun()
-                else:
-                    st.error("密码错误，请重试")
+            # 使用 st.form + form_submit_button：在密码框内按回车即可登录
+            with st.form("login_form", clear_on_submit=False):
+                input_pwd = st.text_input("访问密码", type="password",
+                                          placeholder="请输入访问密码", help="默认密码：123456")
+                submitted = st.form_submit_button("登 录 系 统", type="primary", use_container_width=True)
+                if submitted:
+                    # 从平台后台读取正确密码（本地无 secrets.toml 时自动回退默认密码）
+                    try:
+                        correct_pwd = st.secrets["access_password"]
+                    except Exception:
+                        correct_pwd = "123456"
+                    if input_pwd == correct_pwd:
+                        st.session_state.logged_in = True
+                        st.success("登录成功，正在进入系统...")
+                        st.rerun()
+                    else:
+                        st.error("密码错误，请重试")
         st.stop()  # 密码验证不通过，停止执行后面所有代码
 
 
@@ -1286,7 +1400,6 @@ if st is not None:
                 "💠 浸没式超滤工况",
                 "💰 成本经济核算",
                 "🔮 AI 预测预警",
-                "🛠️ AI 工艺优化与诊断",
                 "💬 AI 工艺助手",
                 "📊 报表导出"
             ]
@@ -2111,6 +2224,120 @@ if st is not None:
 
                 st.info(f"💡 节能提示：曝气系统占总电耗 {res['e_aeration']/res['e_total_day']*100:.1f}%，采用DO变频曝气可节电15%~25%")
 
+            # ===== AI 曝气变频节能实时仿真（演示）=====
+            st.divider()
+            st.subheader("🤖 AI 曝气变频节能实时仿真")
+            st.caption("模拟 AI 根据进水氨氮变化动态调节曝气风机变频器频率，在保证出水达标前提下降低电耗。"
+                       "本模块为机理仿真：风机功率按相似定律 P∝n³ 计算，优化逻辑可对接真实 DCS/PLC。")
+
+            sim_c1, sim_c2 = st.columns(2)
+            with sim_c1:
+                sim_rated_kw = num_input("风机额定功率 (kW)", value=220, key="sim_rated_kw")
+            with sim_c2:
+                sim_mode = st.radio("控制模式", ["🤖 AI 优化", "固定 50Hz（传统）"],
+                                    key="sim_mode", index=1, horizontal=True)
+
+            # 仿真状态
+            if 'aero_sim' not in st.session_state:
+                st.session_state.aero_sim = {'t': [], 'nh3': [], 'do': [], 'tn': [],
+                                             'freq': [], 'power': [], 'base_power': [], 'save': []}
+                st.session_state.aero_t = 0
+            sim = st.session_state.aero_sim
+
+            def aero_step():
+                t = st.session_state.aero_t + 1
+                # 进水氨氮：日周期波动 + 噪声（典型市政污水进水 NH3-N 约 10~55 mg/L）
+                nh3_in = 30.0 + 13.0 * (np.sin(t / 2.5) * 0.5 + 0.5) + float(np.random.normal(0, 2.0))
+                nh3_in = float(np.clip(nh3_in, 10.0, 55.0))
+                if sim_mode == "🤖 AI 优化":
+                    # 机理：进水氨氮越高，硝化需氧量越大，需更高 DO 保证硝化完全
+                    target_do = float(np.clip(1.3 + 0.024 * nh3_in, 1.3, 2.5))
+                    freq = float(np.clip(target_do * 20, 30, 50))      # DO 1.5→30Hz, 2.5→50Hz
+                else:
+                    target_do = 2.0   # 固定 DO 设定
+                    freq = 50.0       # 传统恒速满频
+                power = (freq / 50) ** 3 * sim_rated_kw            # 相似定律
+                base_power = (50 / 50) ** 3 * sim_rated_kw         # 传统恒速基线
+                do_norm = (target_do - 1.5)
+                tn = float(np.clip(13.0 - 5.0 * do_norm + float(np.random.normal(0, 0.35)), 5.0, 25.0))
+                sim['t'].append(t); sim['nh3'].append(nh3_in); sim['do'].append(target_do)
+                sim['tn'].append(tn); sim['freq'].append(freq)
+                sim['power'].append(power); sim['base_power'].append(base_power)
+                sim['save'].append(max(0.0, base_power - power))
+                st.session_state.aero_t = t
+
+            # 控制按钮
+            bb1, bb2, bb3 = st.columns([1, 1, 1])
+            with bb1:
+                if st.button("▶ 开始 / 重置仿真", type="primary", key="aero_start"):
+                    st.session_state.aero_sim = {'t': [], 'nh3': [], 'do': [], 'tn': [],
+                                                 'freq': [], 'power': [], 'base_power': [], 'save': []}
+                    st.session_state.aero_t = 0
+                    st.session_state.sim_mode = "固定 50Hz（传统）"
+                    st.rerun()
+            with bb2:
+                if st.button("⏭ 采集下一帧", key="aero_next"):
+                    aero_step()
+                    st.rerun()
+            with bb3:
+                auto = st.checkbox("自动滚动（3 s）", value=True, key="aero_auto")
+                if auto:
+                    try:
+                        from streamlit_autorefresh import st_autorefresh
+                        st_autorefresh(interval=3000, key="aero_autorefresh")
+                        aero_step()
+                    except ImportError:
+                        st.warning("⚠️ 自动滚动需 `pip install streamlit-autorefresh`，已降级为手动模式。")
+
+            if not sim['t']:
+                aero_step()
+
+            # 累计节电（醒目）
+            total_save = sum(sim['save'])
+            st.success(f"💰 本次模拟累计节省电耗：**{total_save:.1f} kWh**（AI 变频较传统恒速）")
+
+            # 当前指标
+            am1, am2, am3, am4 = st.columns(4)
+            with am1:
+                st.metric("进水氨氮", f"{sim['nh3'][-1]:.1f} mg/L")
+            with am2:
+                st.metric("设定 DO", f"{sim['do'][-1]:.2f} mg/L")
+            with am3:
+                st.metric("风机频率", f"{sim['freq'][-1]:.1f} Hz")
+            with am4:
+                st.metric("实时功率", f"{sim['power'][-1]:.1f} kW")
+
+            # 出水达标判定
+            tn_now = sim['tn'][-1]
+            if tn_now <= 15:
+                st.success(f"✅ 出水 TN {tn_now:.1f} mg/L 达标（≤15 mg/L）")
+            else:
+                st.warning(f"⚠️ 出水 TN {tn_now:.1f} mg/L 接近超标，建议提高 DO")
+
+            # 趋势图
+            df_sim = pd.DataFrame({
+                '帧': sim['t'], '进水氨氮': sim['nh3'], 'DO': sim['do'], '出水TN': sim['tn'],
+                '风机频率': sim['freq'], 'AI功率': sim['power'], '传统功率': sim['base_power']
+            })
+            if go is not None and len(df_sim) > 1:
+                fig_p = go.Figure()
+                fig_p.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['AI功率'], name='AI 变频功率'))
+                fig_p.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['传统功率'], name='传统恒速功率'))
+                fig_p.update_layout(height=280, margin=dict(t=20, b=40, l=40, r=20),
+                                    legend=dict(orientation='h'), title='功率对比 (kW)')
+                st.plotly_chart(fig_p, use_container_width=True)
+                fig_d = go.Figure()
+                fig_d.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['DO'], name='DO', yaxis='y1'))
+                fig_d.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['出水TN'], name='出水TN', yaxis='y2'))
+                fig_d.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['风机频率'], name='频率', yaxis='y1'))
+                fig_d.update_layout(height=280, margin=dict(t=20, b=40, l=40, r=40),
+                                    legend=dict(orientation='h'),
+                                    yaxis=dict(title='DO/频率'),
+                                    yaxis2=dict(title='出水TN', overlaying='y', side='right', range=[0, 25]))
+                st.plotly_chart(fig_d, use_container_width=True)
+            else:
+                st.line_chart(df_sim.set_index('帧')[['AI功率', '传统功率', 'DO', '出水TN', '风机频率']])
+
         # 药剂成本
         with tab2:
             st.subheader("二、药剂成本核算")
@@ -2178,6 +2405,61 @@ if st is not None:
                     st.metric("日药剂总成本", f"{res['total_day']:.2f} 元")
                     st.metric("月药剂总成本", f"{res['total_month']:,.2f} 元")
                     st.metric("吨水药剂成本", f"{res['unit_cost']:.3f} 元/m³")
+
+            # ===== 药剂成本优化方案（智能选型，仅作对照说明，不覆盖上方实际计算）=====
+            st.divider()
+            st.subheader("💡 药剂成本优化方案（智能选型对照）")
+            st.caption("以下为在满足相同碳源 / 除磷需求下，由线性规划在全部可选药剂中自动挑选成本最低组合的「理想方案」。"
+                       "仅用于说明「若改用最优药剂组合，预计可较当前选型节省多少」，不改变上方按实际选型计算的成本。")
+            bio_opt = get_compute_result("bio_result")
+            if not bio_opt:
+                st.warning("⚠️ 请先在「🧪 生化核心计算」页完成计算，以读取碳源缺口与除磷需求。")
+            else:
+                if st.button("🤖 查看 AI 智能优化方案可节省金额", type="primary", key="cost_opt_btn"):
+                    opt = optimize_dosing(bp, bio_opt)
+
+                    # 高亮对比卡片
+                    st.markdown("#### 📊 成本对比（当前选型 vs AI 最优组合）")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("当前选型日药剂成本", f"{opt['cur_cost']:.2f} 元/天")
+                    c2.metric("AI 最优组合日成本", f"{opt['opt_cost']:.2f} 元/天", delta=f"-{(opt['cur_cost']-opt['opt_cost'])/opt['cur_cost']*100:.1f}%")
+                    if opt["saving_pct"] > 0:
+                        c3.metric("💰 每日预计节省", f"{opt['saving']:.2f} 元/天", delta=f"{opt['saving_pct']:.1f}%")
+                    else:
+                        c3.metric("💰 每日预计节省", "0.00 元/天", delta="0.0%")
+
+                    # 进度条式对比
+                    st.markdown("#### 成本降幅可视化")
+                    cur_w, opt_w = opt['cur_cost'], opt['opt_cost']
+                    if cur_w > 0:
+                        ratio = max(0.0, min(1.0, opt_w / cur_w))
+                        st.progress(1.0 - ratio, text=f"AI 优化后较当前成本降低 {(1-ratio)*100:.1f}%")
+                    else:
+                        st.progress(0.0, text="当前成本为 0，无法计算降幅")
+
+                    # 推荐组合
+                    rows_opt = []
+                    for name, dose in opt["rec_carbon"].items():
+                        if dose > 0:
+                            rows_opt.append([f"碳源·{name}", f"{dose:.3f} 吨/天"])
+                    for name, dose in opt["rec_phos"].items():
+                        if dose > 0:
+                            rows_opt.append([f"除磷剂·{name}", f"{dose:.3f} 吨/天"])
+                    if rows_opt:
+                        st.markdown("#### 🧪 AI 推荐药剂组合")
+                        st.table(pd.DataFrame(rows_opt, columns=["药剂", "推荐日投加量"]))
+
+                    # 醒目总结
+                    if opt["saving_pct"] > 0:
+                        st.success(
+                            f"✅ 若采用 AI 推荐的最优组合，预计 **每日节省 {opt['saving']:.2f} 元**，"
+                            f"**每月节省约 {opt['saving']*30:.0f} 元**，**每年可降本约 {opt['saving']*365:.0f} 元**。"
+                        )
+                        st.info(f"提示：当前缺口为 {opt['carbon_deficit']:.1f} mg/L COD、{opt['tp_need_chem']:.2f} mg/L 化学除磷(P)。")
+                    else:
+                        st.info("当前选型已接近成本最优，AI 智能方案无可进一步节省空间。")
+                else:
+                    st.info("点击上方按钮，可查看在当前工艺需求下的最优药剂组合及预计节省金额。")
 
         # 污泥处置成本
         with tab3:
@@ -2394,7 +2676,7 @@ if st is not None:
 
     # ================= 页面8：AI 预测预警 =================
     elif page == "🔮 AI 预测预警":
-        st.header("🔮 进水负荷与出水水质 AI 预测预警")
+        st.header("🔮 出水水质AI预测预警")
         st.caption("多模型集成预测：Holt-Winters + 谐波回归 + 季节朴素，经历史回测逆误差自动加权选优；"
                    "纯算法无需联网。默认载入内置合成测试数据。")
 
@@ -2420,10 +2702,7 @@ if st is not None:
                 "进水TN(mg/L)": None, "进水TP(mg/L)": None,
             }
 
-            with st.expander("⚙️ 高级设置", expanded=False):
-                season = num_input("季节周期（小时，默认日周期=24）", min_value=1, max_value=168,
-                                         value=24, step=1,
-                                         help="数据呈现的周期性长度；小时级数据通常取 24（日周期）")
+            season = 24
             col1, col2 = st.columns(2)
             with col1:
                 var = st.selectbox("预测指标", list(var_options.keys()))
@@ -3058,51 +3337,6 @@ if st is not None:
         )
         st.markdown(_kpi_html, unsafe_allow_html=True)
         st.caption("💡 本驾驶舱使用演示数据绘制；接入真实 SCADA / 运行报表后，各指标、状态光环与告警将随实时数据自动刷新。")
-
-    # ================= 页面11：AI 工艺优化与诊断 =================
-    elif page == "🛠️ AI 工艺优化与诊断":
-        st.header("🛠️ 智能加药优化 与 异常诊断")
-        st.caption("基于线性规划在满足出水标准下最小化药剂成本；超标时给出可解释根因排序")
-
-        bio = get_compute_result("bio_result")
-        if not bio:
-            st.warning("⚠️ 请先在「🧪 生化核心计算」页面完成计算，本页将读取其结果进行优化与诊断。")
-        else:
-            bp = st.session_state.base_params
-            st.subheader("一、智能加药优化（最小成本方案）")
-            if st.button("一键优化投加方案", type="primary", key="opt_btn"):
-                st.session_state.opt_result = optimize_dosing(bp, bio)
-            if "opt_result" in st.session_state:
-                opt = st.session_state.opt_result
-                st.write(f"当前碳源缺口 {opt['carbon_deficit']:.1f} mg/L（COD），化学除磷需求 {opt['tp_need_chem']:.2f} mg/L（P）")
-                rows = []
-                for name, dose in opt["rec_carbon"].items():
-                    if dose > 0:
-                        rows.append([f"碳源·{name}", f"{dose:.3f} 吨/天"])
-                for name, dose in opt["rec_phos"].items():
-                    if dose > 0:
-                        rows.append([f"除磷剂·{name}", f"{dose:.3f} 吨/天"])
-                if not rows:
-                    rows = [["无需外加药剂", "0 吨/天（当前已达标）"]]
-                st.table(pd.DataFrame(rows, columns=["药剂", "推荐日投加量"]))
-                c1, c2, c3 = st.columns(3)
-                c1.metric("当前药剂日成本(元)", f"{opt['cur_cost']:.0f}")
-                c2.metric("优化后药剂日成本(元)", f"{opt['opt_cost']:.0f}")
-                c3.metric("预计可节约", f"{opt['saving']:.0f} 元/天 ({opt['saving_pct']:.1f}%)")
-                if opt["saving_pct"] > 1:
-                    st.success(f"✅ 在满足出水标准前提下，优化方案预计每日节省约 {opt['saving']:.0f} 元药剂费。")
-                else:
-                    st.info("当前投加方案已接近成本最优。")
-
-            st.subheader("二、异常诊断（可解释根因排序）")
-            issues = diagnose_process(bp, bio)
-            if not issues:
-                st.success("✅ 未检出明显异常，当前工艺参数处于合理区间。")
-            else:
-                for title, causes in issues:
-                    with st.expander(f"⚠️ {title}", expanded=True):
-                        for cause, advice, w in sorted(causes, key=lambda x: -x[2]):
-                            st.markdown(f"- **可能原因（置信度 {w * 100:.0f}%）**：{cause}\n\n  → 处置建议：{advice}")
 
     # ================= 页面12：AI 工艺助手 =================
     elif page == "💬 AI 工艺助手":
