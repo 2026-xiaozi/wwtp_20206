@@ -2320,23 +2320,16 @@ if st is not None:
                 '风机频率': sim['freq'], 'AI功率': sim['power'], '传统功率': sim['base_power']
             })
             if go is not None and len(df_sim) > 1:
+                st.markdown("##### 功率对比（kW）")
                 fig_p = go.Figure()
                 fig_p.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['AI功率'], name='AI 变频功率'))
                 fig_p.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['传统功率'], name='传统恒速功率'))
-                fig_p.update_layout(height=280, margin=dict(t=20, b=40, l=40, r=20),
-                                    legend=dict(orientation='h'), title='功率对比 (kW)')
+                fig_p.update_layout(height=280, margin=dict(t=10, b=60, l=50, r=20),
+                                    yaxis=dict(title='功率 (kW)'),
+                                    legend=dict(orientation='h', yanchor='top', y=-0.18))
                 st.plotly_chart(fig_p, use_container_width=True)
-                fig_d = go.Figure()
-                fig_d.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['DO'], name='DO', yaxis='y1'))
-                fig_d.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['出水TN'], name='出水TN', yaxis='y2'))
-                fig_d.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['风机频率'], name='频率', yaxis='y1'))
-                fig_d.update_layout(height=280, margin=dict(t=20, b=40, l=40, r=40),
-                                    legend=dict(orientation='h'),
-                                    yaxis=dict(title='DO/频率'),
-                                    yaxis2=dict(title='出水TN', overlaying='y', side='right', range=[0, 25]))
-                st.plotly_chart(fig_d, use_container_width=True)
             else:
-                st.line_chart(df_sim.set_index('帧')[['AI功率', '传统功率', 'DO', '出水TN', '风机频率']])
+                st.line_chart(df_sim.set_index('帧')[['AI功率', '传统功率']])
 
         # 药剂成本
         with tab2:
@@ -2416,7 +2409,12 @@ if st is not None:
                 st.warning("⚠️ 请先在「🧪 生化核心计算」页完成计算，以读取碳源缺口与除磷需求。")
             else:
                 if st.button("🤖 查看 AI 智能优化方案可节省金额", type="primary", key="cost_opt_btn"):
-                    opt = optimize_dosing(bp, bio_opt)
+                    # 结果持久化到 session_state，避免被电耗 tab 自动刷新触发的整页 rerun 冲掉
+                    st.session_state.dosing_opt_result = optimize_dosing(bp, bio_opt)
+
+                # 持久展示：依据 session_state 渲染，autorefresh 触发的整页 rerun 也不会丢失结果
+                if st.session_state.get('dosing_opt_result'):
+                    opt = st.session_state.dosing_opt_result
 
                     # 高亮对比卡片
                     st.markdown("#### 📊 成本对比（当前选型 vs AI 最优组合）")
@@ -3039,7 +3037,7 @@ if st is not None:
                     rows=2, cols=2,
                     specs=[[{'type': 'indicator'}, {'type': 'indicator'}],
                            [{'type': 'indicator'}, {'type': 'indicator'}]],
-                    vertical_spacing=0.32, horizontal_spacing=0.05
+                    vertical_spacing=0.30, horizontal_spacing=0.22
                 )
                 fig_gauges.add_trace(go.Indicator(
                     mode="gauge+number",
@@ -3047,7 +3045,7 @@ if st is not None:
                     title={"text": "综合运行指数", "font": {"size": 13, "color": "#e2e8f0"}},
                     number={"font": {"size": 28, "color": score_color}},
                     gauge={
-                        "axis": {"range": [0, 100], "tickcolor": "#64748b", "tickwidth": 1},
+                        "axis": {"range": [0, 100], "tickcolor": "#64748b", "tickwidth": 1, "tickfont": {"size": 9, "color": "#94a3b8"}},
                         "bar": {"color": score_color, "thickness": 0.75},
                         "bgcolor": "rgba(15,23,42,0.8)",
                         "bordercolor": "rgba(56,189,236,0.3)",
@@ -3066,7 +3064,7 @@ if st is not None:
                     title={"text": "COD 去除率", "font": {"size": 13, "color": "#e2e8f0"}},
                     number={"font": {"size": 24, "color": "#22d3ee"}, "suffix": "%"},
                     gauge={
-                        "axis": {"range": [0, 100], "tickcolor": "#64748b"},
+                        "axis": {"range": [0, 100], "tickcolor": "#64748b", "tickfont": {"size": 9, "color": "#94a3b8"}},
                         "bar": {"color": "#22d3ee", "thickness": 0.75},
                         "bgcolor": "rgba(15,23,42,0.8)",
                         "bordercolor": "rgba(56,189,236,0.3)",
@@ -3083,7 +3081,7 @@ if st is not None:
                     title={"text": "TN 去除率", "font": {"size": 13, "color": "#e2e8f0"}},
                     number={"font": {"size": 24, "color": "#a78bfa"}, "suffix": "%"},
                     gauge={
-                        "axis": {"range": [0, 100], "tickcolor": "#64748b"},
+                        "axis": {"range": [0, 100], "tickcolor": "#64748b", "tickfont": {"size": 9, "color": "#94a3b8"}},
                         "bar": {"color": "#a78bfa", "thickness": 0.75},
                         "bgcolor": "rgba(15,23,42,0.8)",
                         "bordercolor": "rgba(56,189,236,0.3)",
@@ -3100,7 +3098,7 @@ if st is not None:
                     title={"text": "UF 跨膜压差", "font": {"size": 13, "color": "#e2e8f0"}},
                     number={"font": {"size": 24, "color": "#f472b6"}, "suffix": " kPa"},
                     gauge={
-                        "axis": {"range": [0, 50], "tickcolor": "#64748b"},
+                        "axis": {"range": [0, 50], "tickcolor": "#64748b", "tickfont": {"size": 9, "color": "#94a3b8"}},
                         "bar": {"color": "#f472b6", "thickness": 0.75},
                         "bgcolor": "rgba(15,23,42,0.8)",
                         "bordercolor": "rgba(56,189,236,0.3)",
@@ -3118,8 +3116,8 @@ if st is not None:
                     paper_bgcolor="rgba(0,0,0,0)",
                     plot_bgcolor="rgba(0,0,0,0)",
                     font={"color": "#e2e8f0", "family": "Microsoft YaHei"},
-                    margin=dict(l=10, r=10, t=70, b=10),
-                    height=420,
+                    margin=dict(l=40, r=40, t=60, b=20),
+                    height=380,
                     showlegend=False
                 )
                 st.plotly_chart(fig_gauges, use_container_width=True)
