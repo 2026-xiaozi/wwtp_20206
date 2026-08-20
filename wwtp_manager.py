@@ -1,3 +1,4 @@
+import base64
 import numpy as np
 import os
 import re
@@ -3121,6 +3122,83 @@ if st is not None:
                 bio.get('srt', 0), bio.get('cn_ratio', 0)))
         ctx = "\n".join(ctx_parts) if ctx_parts else "（尚无可用的计算结果，请先在相关页面完成计算）"
 
+        # ===== 页面吉祥物：小鹏（提前渲染，避免流式输出期间消失）=====
+        mascot_path = os.path.join(SCRIPT_DIR, "mascot.png")
+        if os.path.exists(mascot_path):
+            import random
+            _greetings = [
+                "👋 你好！我是小鹏，<br>你的 AI 工艺助手～",
+                "💡 试试问我：「当前总氮偏高怎么处理？」",
+                "🔧 我可以帮你做工艺诊断、预测预警和运行优化哦～",
+                "🌊 五段 Bardenpho 工艺相关问题，我都很熟悉！",
+                "📉 出水 COD 异常？我可以帮你分析可能原因和调控措施。",
+                "⚡ 想优化运行成本？问问我关于电耗和药耗的建议。",
+                "🔮 我可以基于历史数据预测未来出水水质趋势。"
+            ]
+            _greeting = random.choice(_greetings)
+            with open(mascot_path, "rb") as _f:
+                _mascot_b64 = base64.b64encode(_f.read()).decode()
+            st.markdown(f"""
+            <style>
+            .mascot-d {{
+                position: fixed;
+                right: 50px;
+                bottom: 190px;
+                z-index: 9999;
+            }}
+            .mascot-d summary {{
+                list-style: none;
+                cursor: pointer;
+                display: block;
+                width: 110px;
+                height: 110px;
+            }}
+            .mascot-d summary::-webkit-details-marker {{ display: none; }}
+            .mascot-xiao {{
+                width: 100%;
+                height: auto;
+                display: block;
+                filter: drop-shadow(0 6px 12px rgba(0,0,0,0.28));
+                animation: mascot-bob 3s ease-in-out infinite;
+                transition: transform 0.2s ease;
+            }}
+            .mascot-d summary:hover .mascot-xiao {{ transform: scale(1.08); }}
+            @keyframes mascot-bob {{
+                0%, 100% {{ transform: translateY(0) rotate(-1deg); }}
+                50% {{ transform: translateY(-12px) rotate(1deg); }}
+            }}
+            .mascot-tip {{
+                position: fixed;
+                right: 50px;
+                bottom: 315px;
+                z-index: 9999;
+                background: rgba(15,23,42,0.92);
+                color: #e2e8f0;
+                padding: 10px 16px;
+                border-radius: 12px;
+                font-size: 13px;
+                max-width: 200px;
+                line-height: 1.5;
+                box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+                opacity: 0;
+                transform: translateY(8px);
+                transition: opacity 0.3s, transform 0.3s;
+                pointer-events: none;
+                text-align: center;
+            }}
+            .mascot-d[open] .mascot-tip {{
+                opacity: 1;
+                transform: translateY(0);
+            }}
+            </style>
+            <details class="mascot-d">
+                <summary>
+                    <img src="data:image/png;base64,{_mascot_b64}" class="mascot-xiao" title="我是小鹏，你的 AI 工艺助手">
+                </summary>
+                <div class="mascot-tip">{_greeting}</div>
+            </details>
+            """, unsafe_allow_html=True)
+
         if "ai_messages" not in st.session_state:
             st.session_state.ai_messages = []
         for m in st.session_state.ai_messages:
@@ -3135,3 +3213,4 @@ if st is not None:
             st.session_state.ai_messages.append({"role": "assistant", "content": reply})
         if st.button("清空对话", key="ai_clear"):
             st.session_state.ai_messages = []
+
