@@ -1101,12 +1101,16 @@ if st is not None:
     if not st.session_state.logged_in:
         # ============== 登录页 v3：暖调实景背景 + 左信息区 + 右登录卡 ==============
         import base64 as _b64
-        _bg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "登录页背景图_水务平台暖调版.png")
-        try:
-            with open(_bg_file, "rb") as _f:
-                _bg_uri = "data:image/png;base64," + _b64.b64encode(_f.read()).decode()
-        except Exception:
-            _bg_uri = ""
+        # 路径 C（v18-fix）：登录页背景图压到 ~170KB 的 JPEG；编码结果缓存进 session_state，
+        # 避免每次 rerun 重复读盘 + base64 编码（即便有 fragment 刷新也不重复计算）。
+        if "login_bg_uri" not in st.session_state:
+            _bg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "登录页背景图_水务平台暖调版.jpg")
+            try:
+                with open(_bg_file, "rb") as _f:
+                    st.session_state.login_bg_uri = "data:image/jpeg;base64," + _b64.b64encode(_f.read()).decode()
+            except Exception:
+                st.session_state.login_bg_uri = ""
+        _bg_uri = st.session_state.login_bg_uri
 
         # 第①段：背景图 base64 + 左暗右亮遮罩 + 全部登录页 CSS（合并成一个独立 <style> 调用）
         # 关键修复：f-string 会把 CSS 里的 `{...}` 当作表达式去 evaluate，必须改用 % formatting（%s）。
