@@ -629,9 +629,9 @@ def influent_surge_note(var, series, forecast, season=24):
 def _build_sample_df(hours=24*60, seed=20260808):
     """生成 AI 预测页使用的合成演示数据（与 gen_sample_data.py 等价）。
     工况设定：市政污水，设计规模 2 万 m³/d，二沉池后接浸没式超滤（UF）深度处理，
-    出水执行准四类标准（COD≤30、TN≤15、TP≤0.3）；NH₃-N 严于准四类、按 0.45 mg/L 控制，
-    实时检测排放值在对应设计限值的 20%–60% 区间内波动（COD 6–18 / NH₃-N 0.09–0.27 / TN 3–9 / TP 0.06–0.18 mg/L），
-    远低于限值、稳定达标，可清晰展示系统的处理余量。
+    出水执行准四类标准（COD≤30、NH3-N≤1.5、TN≤15、TP≤0.3）；
+    NH₃-N 实时检测值围绕 1.5×30% = 0.45 mg/L 上下波动（实际 0.34–0.56 mg/L），
+    远低于 1.5 限值、稳定达标，可清晰展示系统的处理余量。
     部署时若 sample_wwtp_history.csv 缺失，可即时在内存生成，无需额外文件。"""
     if pd is None:
         raise RuntimeError("需要 pandas 才能生成示例数据")
@@ -668,8 +668,8 @@ def _build_sample_df(hours=24*60, seed=20260808):
     tn_in = nh3_in + polluant(20, 0.10, 0.02, 1.2)
     tp_in = polluant(5.0, 0.12, 0.03, 1.4)
 
-    # 实时检测排放值：落在对应设计限值的 20%–60% 区间内波动（自然漂移+噪声），幅度更明显
-    # 远低于限值，保留较大处理余量，便于观察系统抗冲击性能
+    # 实时检测排放值：围绕 1.5×30% = 0.45 mg/L 上下波动（NH₃-N 特殊项），其余指标落在
+    # 对应设计限值的 20%–60% 区间内。中心值稳定远离限值，保留处理余量。
     def effluent_in_range(limit, lo=0.20, hi=0.60):
         lo_v, hi_v = lo * limit, hi * limit
         center = (lo_v + hi_v) / 2.0
@@ -680,7 +680,7 @@ def _build_sample_df(hours=24*60, seed=20260808):
         return np.clip(val, lo_v * 0.95, hi_v * 1.03)
 
     cod_out = effluent_in_range(30.0)    # 6.0–18.0 mg/L
-    nh3_out = effluent_in_range(0.45)    # 0.09–0.27 mg/L（限值按准四类 1.5 的 30% = 0.45 控制）
+    nh3_out = effluent_in_range(0.45, lo=0.80, hi=1.20)   # 0.36–0.54 mg/L，围绕 0.45 波动
     tn_out = effluent_in_range(15.0)     # 3.0–9.0 mg/L
     tp_out = effluent_in_range(0.3)      # 0.06–0.18 mg/L
 
@@ -3147,7 +3147,7 @@ if st is not None:
         tp_in = _jit(latest.get("进水TP(mg/L)", 0))
         cod_out = _jit(latest.get("出水COD(mg/L)", 15.0))
         tn_out = _jit(latest.get("出水TN(mg/L)", 7.5))
-        nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0.75))
+        nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0.45))
         tp_out = _jit(latest.get("出水TP(mg/L)", 0.15))
         tmp = _jit(8.48)
         score = 100
@@ -3203,8 +3203,8 @@ if st is not None:
             if tn_out > 15:
                 _alarm_msgs.append(f"出水 TN 超标：{tn_out:.2f} mg/L（限值 15）")
                 _diag_actions.append("提高内回流比 R1，必要时投加外碳源")
-            if nh3_out > 0.45:
-                _alarm_msgs.append(f"出水 NH₃-N 超标：{nh3_out:.3f} mg/L（限值 0.45）")
+            if nh3_out > 1.5:
+                _alarm_msgs.append(f"出水 NH₃-N 超标：{nh3_out:.3f} mg/L（限值 1.5）")
                 _diag_actions.append("提高好氧段 DO，检查硝化菌活性")
             if tp_out > 0.3:
                 _alarm_msgs.append(f"出水 TP 超标：{tp_out:.3f} mg/L（限值 0.3）")
@@ -3367,13 +3367,13 @@ if st is not None:
             tn_in = _jit(latest.get("进水TN(mg/L)", 0))
             tp_in = _jit(latest.get("进水TP(mg/L)", 0))
             cod_out = _jit(latest.get("出水COD(mg/L)", 15.0))
-            nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0.225))
+            nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0.45))
             tn_out = _jit(latest.get("出水TN(mg/L)", 7.5))
             tp_out = _jit(latest.get("出水TP(mg/L)", 0.15))
 
             _out_rows = [
                 ("COD (mg/L)", cod_out, 30.0, _ok(cod_out, 30)),
-                ("NH₃-N (mg/L)", nh3_out, 0.45, _ok(nh3_out, 0.45)),
+                ("NH₃-N (mg/L)", nh3_out, 1.5, _ok(nh3_out, 1.5)),
                 ("TN (mg/L)", tn_out, 15.0, _ok(tn_out, 15.0)),
                 ("TP (mg/L)", tp_out, 0.3, _ok(tp_out, 0.3)),
             ]
@@ -3529,7 +3529,7 @@ if st is not None:
         _compliance = (
             df_flow.tail(24).apply(
                 lambda r: (r["出水COD(mg/L)"] <= 30 and r["出水TN(mg/L)"] <= 15 and
-                           r["出水NH3-N(mg/L)"] <= 0.45 and r["出水TP(mg/L)"] <= 0.3), axis=1
+                           r["出水NH3-N(mg/L)"] <= 1.5 and r["出水TP(mg/L)"] <= 0.3), axis=1
             ).mean() * 100
         ) if len(df_flow) >= 24 else 100.0
         _flow_latest = latest.get("进水流量(m3/h)", 833.0)
