@@ -1,4 +1,5 @@
 import base64
+from datetime import timedelta
 import numpy as np
 import os
 import re
@@ -628,8 +629,9 @@ def influent_surge_note(var, series, forecast, season=24):
 def _build_sample_df(hours=24*60, seed=20260808):
     """生成 AI 预测页使用的合成演示数据（与 gen_sample_data.py 等价）。
     工况设定：市政污水，设计规模 2 万 m³/d，二沉池后接浸没式超滤（UF）深度处理，
-    出水执行准 IV 类标准（COD≤30、NH3-N≤1.5、TN≤15、TP≤0.3），
-    出水指标绝大部分落在限值 45%–70% 区间，稳定达标、仅小幅波动。
+    出水执行准四类标准（COD≤30、TN≤15、TP≤0.3）；NH₃-N 严于准四类、按 0.45 mg/L 控制，
+    实时检测排放值在对应设计限值的 20%–60% 区间内波动（COD 6–18 / NH₃-N 0.09–0.27 / TN 3–9 / TP 0.06–0.18 mg/L），
+    远低于限值、稳定达标，可清晰展示系统的处理余量。
     部署时若 sample_wwtp_history.csv 缺失，可即时在内存生成，无需额外文件。"""
     if pd is None:
         raise RuntimeError("需要 pandas 才能生成示例数据")
@@ -666,20 +668,21 @@ def _build_sample_df(hours=24*60, seed=20260808):
     tn_in = nh3_in + polluant(20, 0.10, 0.02, 1.2)
     tp_in = polluant(5.0, 0.12, 0.03, 1.4)
 
-    # 出水（二沉池出水）：绝大部分落在限值 45%–70% 区间，稳定达标
-    def effluent_in_band(limit):
-        lo, hi = 0.45 * limit, 0.70 * limit
-        center = (lo + hi) / 2.0
-        half = (hi - lo) / 2.0
+    # 实时检测排放值：落在对应设计限值的 20%–60% 区间内波动（自然漂移+噪声），幅度更明显
+    # 远低于限值，保留较大处理余量，便于观察系统抗冲击性能
+    def effluent_in_range(limit, lo=0.20, hi=0.60):
+        lo_v, hi_v = lo * limit, hi * limit
+        center = (lo_v + hi_v) / 2.0
+        half = (hi_v - lo_v) / 2.0
         # 3 天慢漂移 + 小幅噪声，使序列在区间内自然波动
         drift = 0.5 * np.sin(2 * np.pi * day_idx / (24 * 3) + 1.0)
         val = center + half * drift + rng.normal(0, half * 0.22, hours)
-        return np.clip(val, lo * 0.95, hi * 1.03)
+        return np.clip(val, lo_v * 0.95, hi_v * 1.03)
 
-    cod_out = effluent_in_band(30.0)   # 13.5–21 mg/L
-    nh3_out = effluent_in_band(1.5)    # 0.675–1.05 mg/L
-    tn_out = effluent_in_band(15.0)    # 6.75–10.5 mg/L
-    tp_out = effluent_in_band(0.3)     # 0.135–0.21 mg/L
+    cod_out = effluent_in_range(30.0)    # 6.0–18.0 mg/L
+    nh3_out = effluent_in_range(0.45)    # 0.09–0.27 mg/L（限值按准四类 1.5 的 30% = 0.45 控制）
+    tn_out = effluent_in_range(15.0)     # 3.0–9.0 mg/L
+    tp_out = effluent_in_range(0.3)      # 0.06–0.18 mg/L
 
     # 浸没式超滤（UF）深度处理：截留悬浮物/胶体/浊度，溶解态污染物基本不变
     # UF 出水 COD 略低于二沉出水（去除颗粒态部分），浊度 <0.1 NTU，跨膜压差 TMP 随运行波动
@@ -1096,161 +1099,358 @@ if st is not None:
     # 未登录时显示登录页
 
     if not st.session_state.logged_in:
-        # —— 登录页专属样式：美化表单，不隐藏全局侧边栏/顶栏 ——
-        st.markdown(r"""
-        <style>
-        /* 登录页：深海科技蓝动态背景（仅在未登录分支注入，登录后自动移除） */
-        .stApp{ background: linear-gradient(180deg,#071c33 0%,#0A2540 45%,#0e3a61 100%) !important; }
-        /* 深海光斑（缓慢浮动，模拟水下光线） */
-        .glow{ position:fixed; border-radius:50%; filter:blur(70px); pointer-events:none; z-index:0; }
-        .g1{ width:440px; height:440px; background:rgba(14,165,233,0.16); top:-100px; right:-80px;
-            animation:drift 20s ease-in-out infinite alternate; }
-        .g2{ width:380px; height:380px; background:rgba(83,74,183,0.20); bottom:-120px; left:-80px;
-            animation:drift 26s ease-in-out infinite alternate-reverse; }
-        @keyframes drift{ 0%{transform:translate(0,0) scale(1);} 100%{transform:translate(-70px,50px) scale(1.18);} }
-        /* 底部波浪层 */
-        .wave-bg{ position:fixed; left:0; bottom:0; width:100%; height:38vh; z-index:0; pointer-events:none; }
-        .wave-bg svg{ position:absolute; left:0; bottom:0; width:200%; height:100%; }
-        .wave-bg path{ fill:rgba(24,95,165,0.30); }
-        .wave1{ animation:waveMove 16s linear infinite; }
-        .wave2{ animation:waveMove 22s linear infinite reverse; opacity:0.7; }
-        .wave3{ animation:waveMove 28s linear infinite; opacity:0.5; }
-        @keyframes waveMove{ 0%{transform:translateX(0);} 100%{transform:translateX(-50%);} }
-        /* 漂浮粒子（气泡感） */
-        .particles{ position:fixed; inset:0; z-index:0; pointer-events:none; overflow:hidden; }
-        .particles span{ position:absolute; bottom:-10px; width:5px; height:5px; border-radius:50%;
-            background:rgba(133,183,235,0.55); filter:blur(1px);
-            animation:rise linear infinite; }
-        @keyframes rise{
-            0%{transform:translateY(0) translateX(0) scale(1); opacity:0;}
-            15%{opacity:0.8;}
-            100%{transform:translateY(-110vh) translateX(25px) scale(0.35); opacity:0;}
-        }
-        /* 表单元素宽度限制 */
-        #login-scope ~ .element-container [data-testid="stForm"]{ max-width:320px; margin:0 auto; }
-        #login-scope ~ .element-container [data-testid="stTextInput"]{ max-width:320px; margin:0 auto; }
-        #login-scope ~ .element-container [data-testid="stTextInput"] input,
-        #login-scope ~ .element-container input[type="password"]{
-            background:rgba(255,255,255,0.95); color:#0f172a;
-            border-radius:10px; border:1.5px solid rgba(24,95,165,0.45);
-            padding:11px 14px; font-size:1rem; transition:border-color .15s, box-shadow .15s;
-        }
-        #login-scope ~ .element-container [data-testid="stTextInput"] input::placeholder,
-        #login-scope ~ .element-container input[type="password"]::placeholder{ color:#94a3b8; }
-        #login-scope ~ .element-container [data-testid="stTextInput"] input:focus,
-        #login-scope ~ .element-container input[type="password"]:focus{
-            border-color:#185FA5; box-shadow:0 0 0 3px rgba(24,95,165,0.22);
-        }
-        /* 登录按钮：多 selector 兼容不同 Streamlit 版本 */
-        #login-scope ~ .element-container button[kind="primaryFormSubmit"],
-        #login-scope ~ .element-container button[kind="primary"],
-        #login-scope ~ .element-container [data-testid="stFormSubmitButton"],
-        #login-scope ~ .element-container [data-testid="stFormSubmitButton"] button{
-            background:#185FA5 !important;
-            color:#fff !important; border:none !important; border-radius:10px !important;
-            font-weight:800 !important; letter-spacing:3px !important;
+        # ============== 登录页 v3：暖调实景背景 + 左信息区 + 右登录卡 ==============
+        import base64 as _b64
+        _bg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "登录页背景图_水务平台暖调版.png")
+        try:
+            with open(_bg_file, "rb") as _f:
+                _bg_uri = "data:image/png;base64," + _b64.b64encode(_f.read()).decode()
+        except Exception:
+            _bg_uri = ""
+
+        # 第①段：背景图 base64 + 左暗右亮遮罩 + 全部登录页 CSS（合并成一个独立 <style> 调用）
+        # 关键修复：f-string 会把 CSS 里的 `{...}` 当作表达式去 evaluate，必须改用 % formatting（%s）。
+        # Streamlit 对"内容只含 <style>"的 st.html 调用走 dompurifyConfig 路径，<style> 整块进 head 全局生效。
+        _bg_value = ('url('+_bg_uri+')' if _bg_uri else 'linear-gradient(180deg,#071c33,#0e3a61)')
+
+        # CSS 主体（含全部登录页样式；用一个 %s 占位符替代背景图 url）
+        _css_full = r"""<style>
+            .stApp{ background:__BG_PLACEHOLDER__ !important;
+                background-size:cover !important; background-position:center center !important;
+                background-repeat:no-repeat !important; background-attachment:fixed !important; }
+            /* 左暗右亮渐变：让左侧白色文字清晰，右侧白卡不与背景冲突 */
+            .stApp::before{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+                background:
+                    linear-gradient(90deg, rgba(7,28,51,0.62) 0%, rgba(7,28,51,0.30) 45%, rgba(255,255,255,0.04) 100%),
+                    radial-gradient(ellipse at top, transparent 35%, rgba(7,28,51,0.18) 100%); }
+            /* 隐藏 Streamlit 默认头/工具/菜单/页脚，让背景图占满 */
+            [data-testid="stHeader"]{ background:transparent !important; }
+            [data-testid="stToolbar"]{ display:none !important; }
+            #MainMenu{ visibility:hidden !important; }
+            footer{ visibility:hidden !important; }
+            /* 隐藏登录页左右两列之间的 Streamlit 列间距，让左右两个半屏真正紧贴 */
+            [data-testid="stHorizontalBlock"]{ gap:0 !important; padding:0 !important; align-items:flex-start !important; }
+            [data-testid="column"]{ padding:0 !important; }
+
+            /* ===== 顶部品牌条 ===== */
+            .top-brand{ position:fixed; top:24px; left:36px; z-index:5;
+            display:flex; align-items:center; gap:12px;
+            color:#fff; font-size:0.95rem; font-weight:600; letter-spacing:1.5px;
+            text-shadow:0 2px 8px rgba(0,0,0,0.45); }
+            .top-brand-mark{
+            width:34px; height:34px; border-radius:8px;
+            background:linear-gradient(135deg,#378ADD 0%,#185FA5 100%);
+            display:flex; align-items:center; justify-content:center;
+            box-shadow:0 6px 18px rgba(56,138,221,0.45);
+            position:relative; overflow:hidden;
+            }
+            /* 纯 CSS 小水滴 v10：用 base64 内联 SVG 作 background-image，
+            形状精确（顶部圆、底部尖、白色高光），不受 sub-pixel 影响。 */
+            .tb-drop{
+            width:16px; height:20px;
+            background-image:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAzMCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMCIgeTE9IjAiIHgyPSIwIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjRkZGRkZGIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjRTBFQUZBIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggZD0iTTEyIDEuNSBDIDEyIDEuNSwgMiAxNCwgMiAxOS41IEMgMiAyNC43LCA2LjUgMjguNSwgMTIgMjguNSBDIDE3LjUgMjguNSwgMjIgMjQuNywgMjIgMTkuNSBDIDIyIDE0LCAxMiAxLjUsIDEyIDEuNSBaIiBmaWxsPSJ1cmwoI2cpIi8+PGVsbGlwc2UgY3g9IjgiIGN5PSIxMCIgcng9IjIuNiIgcnk9IjIuMiIgZmlsbD0icmdiYSgyNTUsMjU1LDI1NSwwLjg1KSIvPjwvc3ZnPg==");
+            background-repeat:no-repeat;
+            background-size:contain;
+            background-position:center;
+            filter:drop-shadow(0 1px 2px rgba(15,30,60,0.25));
+            animation:tbDropPulse 2.6s ease-in-out infinite;
+            }
+            @keyframes tbDropPulse{
+            0%,100%{ transform:scale(1); }
+            50%{ transform:scale(1.12); }
+            }
+            .top-version{
+            position:fixed; top:28px; right:36px; z-index:5;
+            color:rgba(255,255,255,0.92); font-size:0.78rem; letter-spacing:1.2px;
+            background:rgba(15,23,42,0.35);
+            border:1px solid rgba(255,255,255,0.28);
+            padding:6px 14px; border-radius:999px;
+            backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+            text-shadow:0 2px 6px rgba(0,0,0,0.45);
+            }
+
+            /* ===== 左半屏：品牌信息 ===== */
+            .left-info{ position:relative; z-index:2;
+            max-width:620px; margin:0;
+            color:#fff; padding:100px 36px 60px; }
+            .left-eyebrow{ display:inline-block; padding:6px 14px; border-radius:999px;
+            font-size:0.78rem; letter-spacing:2px; font-weight:600;
+            background:rgba(255,255,255,0.16);
+            border:1px solid rgba(255,255,255,0.35);
+            backdrop-filter:blur(8px);
+            color:#FFE0B8; margin-bottom:22px; }
+            .left-title{ font-size:2.6rem; font-weight:900; line-height:1.1;
+            letter-spacing:1.5px; margin:0 0 8px;
+            text-shadow:0 4px 18px rgba(0,0,0,0.5);
+            white-space:nowrap; display:flex; align-items:baseline; flex-wrap:nowrap; }
+            .left-title .core{
+            color:#ffffff !important; -webkit-text-fill-color:#ffffff !important;
+            background:none !important; background-clip:initial !important;
+            font-weight:900; display:inline-block; letter-spacing:1px;
+            }
+            .left-title .accent{
+            background:linear-gradient(90deg,#FFB36B,#FFD58A,#FFCB88);
+            -webkit-background-clip:text; background-clip:text; color:transparent;
+            -webkit-text-fill-color:transparent;
+            margin-left:14px; display:inline-block; font-weight:900;
+            }
+            .left-sub{ margin:14px 0 0; font-size:0.95rem; font-weight:500;
+            color:rgba(255,255,255,0.72);
+            text-shadow:0 2px 10px rgba(0,0,0,0.45);
+            line-height:1.35; }
+            .left-en{ margin-top:6px; font-size:0.72rem; letter-spacing:4px;
+            color:rgba(255,231,200,0.72); font-weight:500;
+            text-shadow:0 2px 10px rgba(0,0,0,0.45); }
+            .left-divider{ width:60px; height:4px; border-radius:3px; margin:30px 0 22px;
+            background:linear-gradient(90deg,#FFB36B,#FFD58A);
+            box-shadow:0 2px 10px rgba(255,179,107,0.55); }
+            .left-features{ list-style:none; padding:0; margin:0; }
+            .left-features li{ display:flex; align-items:center; gap:14px;
+            padding:10px 0;
+            color:rgba(255,255,255,0.96); font-size:1.02rem; font-weight:500;
+            text-shadow:0 2px 8px rgba(0,0,0,0.45); }
+            .left-features .check{
+            width:22px; height:22px; border-radius:50%;
+            background:linear-gradient(135deg,#FFB36B,#FFD58A);
+            display:flex; align-items:center; justify-content:center;
+            flex-shrink:0;
+            color:#fff; font-size:14px; font-weight:900; line-height:1;
+            box-shadow:0 4px 12px rgba(255,179,107,0.45); }
+            .left-features .check svg{ width:12px; height:12px; }
+            .left-tagline{ margin-top:34px; padding:14px 18px;
+            background:rgba(255,255,255,0.10);
+            border:1px solid rgba(255,255,255,0.28);
+            border-radius:12px;
+            color:rgba(255,255,255,0.95); font-size:0.92rem; line-height:1.6;
+            backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); }
+            .left-tagline strong{ color:#FFD58A; font-weight:700; }
+            .left-tagline .hot{ color:#FFD58A; font-weight:700; }
+            .left-tagline .bolt{ display:inline-block; margin-right:6px;
+            color:#FFB36B; font-weight:800; transform:translateY(-1px); }
+
+            /* ===== 右半屏：登录卡 ===== */
+            .right-login-wrap{ position:relative; z-index:2;
+            width:320px; max-width:320px; margin:70px auto 0; padding:0; }
+            .login-card{
+            position:relative; z-index:2; width:320px;
+            background:rgba(255,255,255,0.96); backdrop-filter:blur(20px);
+            -webkit-backdrop-filter:blur(20px);
+            border:1px solid rgba(255,255,255,0.7); border-radius:22px;
+            padding:30px 24px 22px;
+            box-sizing:border-box;
+            box-shadow:0 30px 80px rgba(2,12,27,0.5), 0 0 40px rgba(255,255,255,0.18) inset;
+            text-align:center;
+            }
+            .login-logo{ position:relative; width:72px; height:72px; border-radius:50%; margin:0 auto 16px;
+            display:flex; align-items:center; justify-content:center;
+            background:linear-gradient(135deg,#378ADD,#185FA5);
+            box-shadow:0 12px 30px rgba(24,95,165,0.45), 0 0 0 4px rgba(255,255,255,0.7); }
+            /* 水波纹：v9 同心圆扩散，初始 size=22px 与水滴同大，向外淡出，
+            颜色与水滴（白）保持同源，强化"水从水滴外溢"的语义。 */
+            .login-ripple{ position:absolute; left:50%; top:50%;
+            width:22px; height:22px; margin:-11px 0 0 -11px;
+            border:1.5px solid rgba(255,255,255,0.9); border-radius:50%;
+            opacity:0; transform:scale(0.55);
+            animation:loginRipple 2.6s ease-out infinite; }
+            .login-ripple.r2{ animation-delay:0.9s; }
+            .login-ripple.r3{ animation-delay:1.7s; }
+            @keyframes loginRipple{
+            0%{ transform:scale(0.55); opacity:0.85; }
+            100%{ transform:scale(2.4); opacity:0; }
+            }
+            /* 纯 CSS 白水滴 v10：与 .tb-drop 同一 SVG 资源，仅尺寸更大、阴影更明显 */
+            .login-drop{ position:relative; width:28px; height:34px;
+            background-image:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAzMCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMCIgeTE9IjAiIHgyPSIwIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjRkZGRkZGIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjRDhFNUY4Ii8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggZD0iTTEyIDEuNSBDIDEyIDEuNSwgMiAxNCwgMiAxOS41IEMgMiAyNC43LCA2LjUgMjguNSwgMTIgMjguNSBDIDE3LjUgMjguNSwgMjIgMjQuNywgMjIgMTkuNSBDIDIyIDE0LCAxMiAxLjUsIDEyIDEuNSBaIiBmaWxsPSJ1cmwoI2cpIi8+PGVsbGlwc2UgY3g9IjgiIGN5PSIxMCIgcng9IjIuNiIgcnk9IjIuMiIgZmlsbD0icmdiYSgyNTUsMjU1LDI1NSwwLjkpIi8+PC9zdmc+");
+            background-repeat:no-repeat;
+            background-size:contain;
+            background-position:center;
+            filter:drop-shadow(0 2px 3px rgba(15,30,60,0.30));
+            animation:loginDropBreath 3.0s ease-in-out infinite; }
+            @keyframes loginDropBreath{
+            0%,100%{ transform:scale(1); }
+            50%{ transform:scale(1.08); }
+            }
+
+            .login-title{ font-size:1.65rem; font-weight:800; color:#0f172a;
+            letter-spacing:1px; margin:0; }
+            .login-sub{ margin-top:6px; font-size:0.78rem; font-weight:600;
+            color:#185FA5; letter-spacing:1.5px; }
+            .login-en{ margin-top:4px; font-size:0.62rem; letter-spacing:3px;
+            color:#64748b; text-transform:uppercase; }
+            .login-divider-card{ width:50px; height:2.5px; border-radius:2px;
+            margin:14px auto 4px;
+            background:linear-gradient(90deg,#185FA5,#534AB7); }
+
+            /* ===== 表单融入登录卡 ===== */
+            /* 说明：st.html(.right-login-wrap) 与 st.form() 是兄弟节点（并列在列内），
+            因此不能用 .right-login-wrap 作后代锚点。改用全局 data-testid 选择器。 */
+            [data-testid="stForm"]{
+            background:transparent !important; border:none !important;
+            padding:14px 0 0 !important; margin:0 auto !important;
+            width:320px !important; max-width:320px !important; min-width:320px !important;
+            box-sizing:border-box !important; }
+            [data-testid="stTextInput"]{
+            width:320px !important; max-width:320px !important; min-width:320px !important;
+            margin:0 auto 14px !important; display:block !important;
+            box-sizing:border-box !important; }
+            [data-testid="stTextInput"] > label{ display:none !important; }
+            [data-testid="stTextInput"] input,
+            input[type="password"]{
+            background:#F4F7FA !important; color:#0f172a !important;
+            border-radius:12px !important;
+            border:1.5px solid rgba(24,95,165,0.35) !important;
+            padding:13px 16px !important; font-size:0.98rem !important;
+            transition:border-color .15s, box-shadow .15s, background .15s !important;
+            width:100% !important; max-width:100% !important; min-width:100% !important;
+            box-shadow:none !important; box-sizing:border-box !important; }
+            [data-testid="stTextInput"] input::placeholder,
+            input[type="password"]::placeholder{
+            color:#94a3b8 !important; }
+            [data-testid="stTextInput"] input:focus,
+            input[type="password"]:focus{
+            background:#fff !important; border-color:#185FA5 !important;
+            box-shadow:0 0 0 3px rgba(24,95,165,0.18) !important;
+            outline:none !important; }
+
+            /* 登录按钮：蓝渐变，覆盖主题 primary 红 */
+            [data-testid="stFormSubmitButton"] button,
+            button[kind="primaryFormSubmit"]{
+            background:linear-gradient(135deg,#185FA5 0%,#378ADD 100%) !important;
+            color:#fff !important; border:none !important; border-radius:12px !important;
+            font-weight:800 !important; letter-spacing:4px !important;
+            font-size:1.02rem !important;
             box-shadow:0 10px 24px rgba(24,95,165,0.45) !important;
             transition:transform .15s ease, box-shadow .15s ease !important;
-            padding:0.6rem 1rem !important; width:100% !important;
-        }
-        #login-scope ~ .element-container button[kind="primaryFormSubmit"]:hover,
-        #login-scope ~ .element-container button[kind="primary"]:hover,
-        #login-scope ~ .element-container [data-testid="stFormSubmitButton"]:hover,
-        #login-scope ~ .element-container [data-testid="stFormSubmitButton"] button:hover{
+            padding:14px 18px !important;
+            width:100% !important; min-width:320px !important; max-width:320px !important;
+            margin:6px auto 0 !important; display:block !important;
+            box-sizing:border-box !important; }
+            [data-testid="stFormSubmitButton"] button:hover,
+            button[kind="primaryFormSubmit"]:hover{
             transform:translateY(-2px) !important;
-            box-shadow:0 14px 30px rgba(24,95,165,0.6) !important;
-        }
-        .login-card{ position:relative; z-index:1; max-width:480px; margin:8vh auto 2vh; text-align:center;
-            background:rgba(255,255,255,0.88); backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px);
-            border:1px solid rgba(24,95,165,0.35); border-radius:20px;
-            padding:42px 34px;
-            box-shadow:0 24px 60px rgba(2,12,27,0.55), 0 0 24px rgba(24,95,165,0.18) inset; }
-        .login-logo{ width:80px;height:80px;border-radius:50%;margin:0 auto 18px;
-            display:flex;align-items:center;justify-content:center;
-            background:rgba(255,255,255,0.95);
-            border:1px solid rgba(24,95,165,0.40);
-            box-shadow:0 10px 28px rgba(24,95,165,0.35); }
-        .login-logo-svg{ width:50px; height:50px; }
-        .ripple{ transform-origin:center; animation:ripplePulse 2.4s ease-out infinite; opacity:0; }
-        .r1{ animation-delay:0s; } .r2{ animation-delay:0.8s; } .r3{ animation-delay:1.6s; }
-        @keyframes ripplePulse{ 0%{transform:scale(0.7); opacity:0.6;} 100%{transform:scale(1.15); opacity:0;} }
-        .login-drop{ transform-origin:50% 55%; animation:dropBreath 3.2s ease-in-out infinite; }
-        @keyframes dropBreath{ 0%,100%{transform:scale(1);} 50%{transform:scale(1.07);} }
-        .login-title{ font-size:2.5rem;font-weight:800;color:#0f172a;letter-spacing:1px; line-height:1.3; }
-        .login-sub{ margin-top:8px;font-size:1.0rem;font-weight:600;color:#0C447C; }
-        .login-en{ margin-top:8px;font-size:.7rem;letter-spacing:3px;color:#64748b;
-            text-transform:uppercase; }
-        .login-divider{ width:72px;height:3px;border-radius:2px;margin:20px auto;
-            background:linear-gradient(90deg,#185FA5,#534AB7); }
-        .login-tip{ color:#7c8ba1;font-size:.8rem;font-weight:400; }
-        </style>
-        <div class="glow g1"></div>
-        <div class="glow g2"></div>
-        <div class="wave-bg">
-            <svg viewBox="0 0 1440 320" preserveAspectRatio="none" class="wave1">
-                <path d="M0,160L48,176C96,192,192,224,288,224C384,224,480,192,576,170.7C672,149,768,139,864,154.7C960,171,1056,213,1152,218.7C1248,224,1344,192,1392,176L1440,160L1440,320L1392,320C1344,320,1248,320,1152,320C1056,320,960,320,864,320C768,320,672,320,576,320C480,320,384,320,288,320C192,320,96,320,48,320L0,320Z"></path>
-            </svg>
-            <svg viewBox="0 0 1440 320" preserveAspectRatio="none" class="wave2">
-                <path d="M0,224L48,213.3C96,203,192,181,288,181.3C384,181,480,203,576,224C672,245,768,267,864,250.7C960,235,1056,181,1152,165.3C1248,149,1344,171,1392,181.3L1440,192L1440,320L1392,320C1344,320,1248,320,1152,320C1056,320,960,320,864,320C768,320,672,320,576,320C480,320,384,320,288,320C192,320,96,320,48,320L0,320Z"></path>
-            </svg>
-            <svg viewBox="0 0 1440 320" preserveAspectRatio="none" class="wave3">
-                <path d="M0,96L48,117.3C96,139,192,181,288,186.7C384,192,480,160,576,149.3C672,139,768,149,864,165.3C960,181,1056,203,1152,197.3C1248,192,1344,160,1392,149.3L1440,138.7L1440,320L1392,320C1344,320,1248,320,1152,320C1056,320,960,320,864,320C768,320,672,320,576,320C480,320,384,320,288,320C192,320,96,320,48,320L0,320Z"></path>
-            </svg>
-        </div>
-        <div class="particles">
-            <span style="left:8%;animation-duration:11s;animation-delay:0s"></span>
-            <span style="left:18%;animation-duration:14s;animation-delay:1.2s"></span>
-            <span style="left:28%;animation-duration:12s;animation-delay:2.5s"></span>
-            <span style="left:38%;animation-duration:16s;animation-delay:0.8s"></span>
-            <span style="left:48%;animation-duration:13s;animation-delay:3.2s"></span>
-            <span style="left:58%;animation-duration:15s;animation-delay:1.8s"></span>
-            <span style="left:68%;animation-duration:10s;animation-delay:4.0s"></span>
-            <span style="left:78%;animation-duration:17s;animation-delay:2.2s"></span>
-            <span style="left:88%;animation-duration:12s;animation-delay:0.4s"></span>
-            <span style="left:95%;animation-duration:14s;animation-delay:3.8s"></span>
-            <span style="left:12%;animation-duration:18s;animation-delay:5.0s"></span>
-            <span style="left:22%;animation-duration:13s;animation-delay:2.0s"></span>
-            <span style="left:35%;animation-duration:16s;animation-delay:4.5s"></span>
-            <span style="left:52%;animation-duration:11s;animation-delay:1.0s"></span>
-            <span style="left:65%;animation-duration:15s;animation-delay:3.0s"></span>
-            <span style="left:82%;animation-duration:12s;animation-delay:5.5s"></span>
-        </div>
-        <div id="login-scope"></div>
-        <div class="login-card">
-            <div class="login-logo">
-                <svg viewBox="0 0 100 100" class="login-logo-svg">
-                    <defs>
-                        <linearGradient id="dropGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                            <stop offset="0%" stop-color="#378ADD"/>
-                            <stop offset="100%" stop-color="#185FA5"/>
-                        </linearGradient>
-                    </defs>
-                    <circle class="ripple r1" cx="50" cy="55" r="28" fill="none" stroke="url(#dropGrad)" stroke-width="2"/>
-                    <circle class="ripple r2" cx="50" cy="55" r="38" fill="none" stroke="url(#dropGrad)" stroke-width="1.6"/>
-                    <circle class="ripple r3" cx="50" cy="55" r="48" fill="none" stroke="url(#dropGrad)" stroke-width="1.2"/>
-                    <g class="login-drop">
-                        <path d="M50 22 C50 22, 32 42, 32 56 C32 69, 40 80, 50 80 C60 80, 68 69, 68 56 C68 42, 50 22, 50 22 Z" fill="url(#dropGrad)"/>
-                        <path d="M42 46 C44 40, 47 37, 50 35 C48 41, 46 44, 42 46 Z" fill="#ffffff" opacity="0.65"/>
-                    </g>
-                </svg>
-            </div>
-            <div class="login-title">CoreMate</div>
-            <div class="login-sub">基于五段 Bardenpho + AI 的污水厂智慧运维平台</div>
-            <div class="login-en">AI-Driven WWTP Intelligent O&amp;M Platform</div>
-            <div class="login-divider"></div>
-            <div class="login-tip">AI驱动 · 成本优化 · 数字孪生</div>
-        </div>
-        """, unsafe_allow_html=True)
+            box-shadow:0 14px 30px rgba(24,95,165,0.6) !important; }
 
-        col1, col2, col3 = st.columns([1, 1.6, 1])
-        with col2:
-            # 使用 st.form + form_submit_button：在密码框内按回车即可登录
-            with st.form("login_form", clear_on_submit=False):
+            /* 底部链接：忘记密码/没有账号 */
+            .login-bottom-links{ margin-top:18px; display:flex;
+            justify-content:space-between; font-size:0.82rem; color:#64748b; }
+            .login-bottom-links a{ color:#185FA5; text-decoration:none; font-weight:600; transition:color .15s; }
+            .login-bottom-links a:hover{ color:#378ADD; }
+
+            /* ===== 底部品牌条 ===== */
+            .bottom-brand{
+            position:fixed; left:0; bottom:0; z-index:5; width:100%;
+            padding:18px 36px;
+            display:flex; justify-content:space-between; align-items:center;
+            color:rgba(255,255,255,0.78); font-size:0.78rem; letter-spacing:1.2px;
+            background:linear-gradient(180deg, transparent, rgba(7,28,51,0.55));
+            text-shadow:0 2px 8px rgba(0,0,0,0.45); pointer-events:none; }
+            .bottom-brand .copy{ display:flex; align-items:center; gap:8px; }
+            .bottom-brand .links{ display:flex; gap:18px; }
+            .bottom-brand .links a{
+            color:rgba(255,255,255,0.78); text-decoration:none; pointer-events:auto; }
+            .bottom-brand .links a:hover{ color:#FFD58A; }
+
+            /* 响应式：≤900 改为上下堆叠 */
+            @media (max-width: 900px){
+            .top-brand{ left:18px; top:14px; }
+            .top-version{ right:18px; top:18px; font-size:0.7rem; }
+            .left-info{ padding:60px 24px 24px; }
+            .left-title{ font-size:2.4rem; }
+            .left-sub{ font-size:1rem; }
+            .right-login-wrap{ margin-top:20px; }
+            .bottom-brand{ padding:14px 18px; flex-direction:column; gap:6px; }
+            }
+            </style>"""
+        # 关键修复：st.html() 渲染的 <style> 被 Streamlit 作用域隔离/净化，无法全局生效；
+        # 全局 CSS 必须用 st.markdown(..., unsafe_allow_html=True) 注入（已实证可全局生效）。
+        st.markdown(_css_full.replace("__BG_PLACEHOLDER__", _bg_value), unsafe_allow_html=True)
+
+        # 第②.⑤段：顶部品牌条 + 底部版权条 — 用 st.html() 独立渲染（仅结构，不含 <style>）
+        st.html(r"""
+        <div class="top-brand">
+            <div class="top-brand-mark">
+                <div class="tb-drop"></div>
+            </div>
+            <span>CoreMate · 智慧水务</span>
+        </div>
+        <div class="top-version">v1.2.0 · 2026 · 山东招金膜天</div>
+
+        <div class="bottom-brand">
+            <div class="copy">© 2026 CoreMate · AI-Driven WWTP Intelligent O&amp;M Platform</div>
+            <div class="links">
+                <a href="javascript:void(0)">用户手册</a>
+                <a href="javascript:void(0)">工艺支持</a>
+                <a href="javascript:void(0)">联系我们</a>
+            </div>
+        </div>
+        """)
+        col_left, col_right = st.columns([1.05, 1])
+
+        with col_left:
+            st.html(r"""
+            <div class="left-info">
+                <div class="left-eyebrow">智慧水务 · AI 驱动 · 数字孪生</div>
+                <h1 class="left-title"><span class="core">CoreMate</span><span class="accent">智慧水务</span></h1>
+                <p class="left-sub">基于五段 Bardenpho 工艺 + AI 大模型的</p>
+                <p class="left-sub">污水处理厂全场景智慧运维平台</p>
+                <div class="left-en">AI-DRIVEN WWTP INTELLIGENT O&amp;M PLATFORM</div>
+
+                <div class="left-divider"></div>
+
+                <ul class="left-features">
+                    <li>
+                        <span class="check">✓</span>
+                        五段 Bardenpho 工艺内嵌，全工艺流程可视化建模
+                    </li>
+                    <li>
+                        <span class="check">✓</span>
+                        AI 预测出水水质、加药量、能耗等关键运行参数
+                    </li>
+                    <li>
+                        <span class="check">✓</span>
+                        数字孪生驱动降碳增效，动态求解运行成本最优解
+                    </li>
+                    <li>
+                        <span class="check">✓</span>
+                        自然语言交互，毫秒级响应工艺咨询与运行决策
+                    </li>
+                </ul>
+
+                <div class="left-tagline">
+                    <span class="bolt">▸</span> 从 <span class="hot">机理模型</span> 到 <span class="hot">AI 模型</span> 到 <span class="hot">运维界面</span> <span class="hot">全栈自研</span>
+                </div>
+            </div>
+            """)
+
+        with col_right:
+            st.html(r"""
+            <div class="right-login-wrap">
+                <div class="login-card">
+                    <div class="login-logo">
+                        <div class="login-ripple r1"></div>
+                        <div class="login-ripple r2"></div>
+                        <div class="login-ripple r3"></div>
+                        <div class="login-drop"></div>
+                    </div>
+                    <h2 class="login-title">欢迎登录</h2>
+                    <div class="login-sub">CORE&nbsp;MATE&nbsp;&middot;&nbsp;智慧水务</div>
+                    <div class="login-en">Welcome to CoreMate</div>
+                    <div class="login-divider-card"></div>
+                </div>
+                <div class="login-bottom-links">
+                    <a href="javascript:void(0)">忘记密码？</a>
+                    <a href="javascript:void(0)">注册新账号</a>
+                </div>
+            </div>
+            """)
+
+            with st.form("login_form_v3", clear_on_submit=False):
                 input_pwd = st.text_input("访问密码", type="password",
-                                          placeholder="请输入访问密码", help="默认密码：123456")
-                submitted = st.form_submit_button("登 录 系 统", type="primary", use_container_width=True)
+                                          placeholder="🔒  请输入访问密码",
+                                          help="默认密码：123456", label_visibility="collapsed")
+                submitted = st.form_submit_button("登 录 系 统", type="primary",
+                                                  use_container_width=True)
                 if submitted:
-                    # 从平台后台读取正确密码（本地无 secrets.toml 时自动回退默认密码）
                     try:
                         correct_pwd = st.secrets["access_password"]
                     except Exception:
@@ -2008,60 +2208,62 @@ if st is not None:
             sim['turb'].append(turb)
             st.session_state.uf_t = t
 
-        # ---------- ② 实时监测模拟控制 ----------
-        st.markdown("---")
-        st.subheader("② 实时监测模拟")
-        b1, b2, b3 = st.columns([1, 1, 1])
-        with b1:
-            if st.button("▶ 开始 / 重置模拟", type="primary", key="uf_start"):
-                st.session_state.uf_sim = {'t': [], 'flux': [], 'tmp': [], 'aer': [], 'turb': []}
-                st.session_state.uf_t = 0
-                st.rerun()
-        with b2:
-            if st.button("⏭ 采集下一帧", key="uf_next"):
+        # ---------- ②③ 实时监测 + 指标自包含 fragment（每 1.5s 自动重跑） ----------
+        # 关键改动：把"采集下一帧 / 自动滚动 checkbox / 4 个指标 metric / 报警文案"
+        # 全部塞进同一个 @st.fragment(run_every=1.5)，避免 v12 时 fragment 内只推进数据、
+        # 但 4 个 metric 在 fragment 外、run_every 不触发整页 rerun → 数值看似"不刷新"的 bug。
+        @st.fragment(run_every=1.5)
+        def _uf_live():
+            # 先按需推进一帧（首次或自动滚动开启时）
+            if not sim['t']:
                 uf_step()
-                st.rerun()
-        with b3:
-            auto = st.checkbox("自动滚动（每 1.5 s 一帧）", value=True, key="uf_auto")
-            if auto:
-                try:
-                    from streamlit_autorefresh import st_autorefresh
-                    # 该组件在后台 1.5s 后自动触发 rerun；每次 rerun 进入本分支都会再采集一帧
-                    st_autorefresh(interval=1500, key="uf_autorefresh")
+            elif st.session_state.get("uf_auto", True):
+                uf_step()
+
+            # ---------- ② 控制按钮 + 自动滚动开关 ----------
+            st.markdown("---")
+            st.subheader("② 实时监测模拟")
+            b1, b2, b3 = st.columns([1, 1, 1])
+            with b1:
+                if st.button("▶ 开始 / 重置模拟", type="primary", key="uf_start"):
+                    st.session_state.uf_sim = {'t': [], 'flux': [], 'tmp': [], 'aer': [], 'turb': []}
+                    st.session_state.uf_t = 0
+                    st.rerun(scope="fragment")
+            with b2:
+                if st.button("⏭ 采集下一帧", key="uf_next"):
                     uf_step()
-                except ImportError:
-                    st.warning("⚠️ 自动滚动需要 `pip install streamlit-autorefresh`，当前未安装，已降级为手动模式。")
+                    st.rerun(scope="fragment")
+            with b3:
+                st.checkbox("自动滚动（每 1.5 s 一帧）", value=True, key="uf_auto")
 
-        if not sim['t']:
-            uf_step()
-
-        # ---------- ③ 当前实时指标与预警 ----------
-        t_now = sim['t'][-1]
-        flux_now = sim['flux'][-1]
-        tmp_now = sim['tmp'][-1]
-        aer_now = sim['aer'][-1]
-        turb_now = sim['turb'][-1]
-
-        st.markdown("---")
-        st.subheader("③ 当前实时指标与预警")
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            st.metric("运行通量", f"{flux_now:.1f} LMH", help="设计区间 22~26 LMH")
-        with m2:
+            # ---------- ③ 当前实时指标与预警 ----------
+            flux_now = sim['flux'][-1]
+            tmp_now = sim['tmp'][-1]
+            aer_now = sim['aer'][-1]
+            turb_now = sim['turb'][-1]
             delta = tmp_now - sim['tmp'][-2] if len(sim['tmp']) > 1 else None
-            st.metric("跨膜压差 TMP", f"{tmp_now:.2f} kPa",
-                      delta=f"{delta:+.2f}" if delta is not None else None)
-        with m3:
-            st.metric("曝气强度", f"{aer_now:.1f} m³/(m²·h)", help="设计区间 60~70")
-        with m4:
-            st.metric("出水浊度", f"{turb_now:.3f} NTU", help="设计区间 0.02~0.06")
 
-        if tmp_now >= tmp_alarm:
-            st.error(f"⛔ TMP 已达报警限值（{tmp_alarm:.0f} kPa）：立即执行 CIP 化学清洗 / 完整性检测，必要时降负荷")
-        elif tmp_now >= ceb_thr:
-            st.warning(f"⚠️ TMP 超过 CEB 反洗阈值（{ceb_thr:.0f} kPa）：建议尽快安排 CEB 加强反洗")
-        else:
-            st.success(f"✅ 工况正常：TMP 距 CEB 阈值尚有 {ceb_thr - tmp_now:.1f} kPa 余量")
+            st.markdown("---")
+            st.subheader("③ 当前实时指标与预警")
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("运行通量", f"{flux_now:.1f} LMH", help="设计区间 22~26 LMH")
+            with m2:
+                st.metric("跨膜压差 TMP", f"{tmp_now:.2f} kPa",
+                          delta=f"{delta:+.2f}" if delta is not None else None)
+            with m3:
+                st.metric("曝气强度", f"{aer_now:.1f} m³/(m²·h)", help="设计区间 60~70")
+            with m4:
+                st.metric("出水浊度", f"{turb_now:.3f} NTU", help="设计区间 0.02~0.06")
+
+            if tmp_now >= tmp_alarm:
+                st.error(f"⛔ TMP 已达报警限值（{tmp_alarm:.0f} kPa）：立即执行 CIP 化学清洗 / 完整性检测，必要时降负荷")
+            elif tmp_now >= ceb_thr:
+                st.warning(f"⚠️ TMP 超过 CEB 反洗阈值（{ceb_thr:.0f} kPa）：建议尽快安排 CEB 加强反洗")
+            else:
+                st.success(f"✅ 工况正常：TMP 距 CEB 阈值尚有 {ceb_thr - tmp_now:.1f} kPa 余量")
+
+        _uf_live()
 
         # ---------- ④ 运行趋势 ----------
         st.markdown("---")
@@ -2234,8 +2436,9 @@ if st is not None:
             with sim_c1:
                 sim_rated_kw = num_input("风机额定功率 (kW)", value=220, key="sim_rated_kw")
             with sim_c2:
-                sim_mode = st.radio("控制模式", ["🤖 AI 优化", "固定 50Hz（传统）"],
-                                    key="sim_mode", index=1, horizontal=True)
+                # v17: 默认切到 AI 优化，避免"固定 50Hz（传统）"模式把 DO/Hz/功率锁定，看起来像"不动"
+                st.radio("控制模式", ["🤖 AI 优化", "固定 50Hz（传统）"],
+                         key="sim_mode", index=0, horizontal=True)
 
             # 仿真状态
             if 'aero_sim' not in st.session_state:
@@ -2249,15 +2452,18 @@ if st is not None:
                 # 进水氨氮：日周期波动 + 噪声（典型市政污水进水 NH3-N 约 10~55 mg/L）
                 nh3_in = 30.0 + 13.0 * (np.sin(t / 2.5) * 0.5 + 0.5) + float(np.random.normal(0, 2.0))
                 nh3_in = float(np.clip(nh3_in, 10.0, 55.0))
-                if sim_mode == "🤖 AI 优化":
-                    # 机理：进水氨氮越高，硝化需氧量越大，需更高 DO 保证硝化完全
+                # v17: sim_mode / sim_rated_kw 现在走 session_state（radio/num_input 自动写入）；
+                # 不能继续用 fragment 外的局部变量（fragment 内可能读到旧值）
+                _mode = st.session_state.get("sim_mode", "🤖 AI 优化")
+                _rated_kw = st.session_state.get("sim_rated_kw", 220)
+                if _mode == "🤖 AI 优化":
                     target_do = float(np.clip(1.3 + 0.024 * nh3_in, 1.3, 2.5))
                     freq = float(np.clip(target_do * 20, 30, 50))      # DO 1.5→30Hz, 2.5→50Hz
                 else:
-                    target_do = 2.0   # 固定 DO 设定
-                    freq = 50.0       # 传统恒速满频
-                power = (freq / 50) ** 3 * sim_rated_kw            # 相似定律
-                base_power = (50 / 50) ** 3 * sim_rated_kw         # 传统恒速基线
+                    target_do = 2.0
+                    freq = 50.0
+                power = (freq / 50) ** 3 * _rated_kw
+                base_power = (50 / 50) ** 3 * _rated_kw
                 do_norm = (target_do - 1.5)
                 tn = float(np.clip(13.0 - 5.0 * do_norm + float(np.random.normal(0, 0.35)), 5.0, 25.0))
                 sim['t'].append(t); sim['nh3'].append(nh3_in); sim['do'].append(target_do)
@@ -2266,70 +2472,74 @@ if st is not None:
                 sim['save'].append(max(0.0, base_power - power))
                 st.session_state.aero_t = t
 
-            # 控制按钮
-            bb1, bb2, bb3 = st.columns([1, 1, 1])
-            with bb1:
-                if st.button("▶ 开始 / 重置仿真", type="primary", key="aero_start"):
-                    st.session_state.aero_sim = {'t': [], 'nh3': [], 'do': [], 'tn': [],
-                                                 'freq': [], 'power': [], 'base_power': [], 'save': []}
-                    st.session_state.aero_t = 0
-                    st.session_state.sim_mode = "固定 50Hz（传统）"
-                    st.rerun()
-            with bb2:
-                if st.button("⏭ 采集下一帧", key="aero_next"):
+            # ---------- 控制 + 指标 + 趋势 自包含 fragment（每 3s 自动重跑，与 UF 同套修复） ----------
+            # 把"开始/重置/采集下一帧 + 自动滚动 checkbox + 4 个指标 metric + 达标提示 + 功率对比图"
+            # 全部塞进同一个 @st.fragment(run_every=3)。原 v12 写法只在 fragment 内推进数据、
+            # metric 与图表在 fragment 外，run_every 不触发整页 rerun → 数值看似"不刷新"。
+            @st.fragment(run_every=3)
+            def _aero_live():
+                # 数据推进（首次或勾选自动滚动时）
+                if not sim['t']:
                     aero_step()
-                    st.rerun()
-            with bb3:
-                auto = st.checkbox("自动滚动（3 s）", value=True, key="aero_auto")
-                if auto:
-                    try:
-                        from streamlit_autorefresh import st_autorefresh
-                        st_autorefresh(interval=3000, key="aero_autorefresh")
+                elif st.session_state.get("aero_auto", True):
+                    aero_step()
+
+                # 控制按钮 + checkbox
+                bb1, bb2, bb3 = st.columns([1, 1, 1])
+                with bb1:
+                    if st.button("▶ 开始 / 重置仿真", type="primary", key="aero_start"):
+                        st.session_state.aero_sim = {'t': [], 'nh3': [], 'do': [], 'tn': [],
+                                                     'freq': [], 'power': [], 'base_power': [], 'save': []}
+                        st.session_state.aero_t = 0
+                        st.session_state.sim_mode = "🤖 AI 优化"
+                        st.rerun(scope="fragment")
+                with bb2:
+                    if st.button("⏭ 采集下一帧", key="aero_next"):
                         aero_step()
-                    except ImportError:
-                        st.warning("⚠️ 自动滚动需 `pip install streamlit-autorefresh`，已降级为手动模式。")
+                        st.rerun(scope="fragment")
+                with bb3:
+                    st.checkbox("自动滚动（3 s）", value=True, key="aero_auto")
 
-            if not sim['t']:
-                aero_step()
+                # 累计节电（醒目）
+                total_save = sum(sim['save'])
+                st.success(f"💰 本次模拟累计节省电耗：**{total_save:.1f} kWh**（AI 变频较传统恒速）")
 
-            # 累计节电（醒目）
-            total_save = sum(sim['save'])
-            st.success(f"💰 本次模拟累计节省电耗：**{total_save:.1f} kWh**（AI 变频较传统恒速）")
+                # 4 个实时指标
+                am1, am2, am3, am4 = st.columns(4)
+                with am1:
+                    st.metric("进水氨氮", f"{sim['nh3'][-1]:.1f} mg/L")
+                with am2:
+                    st.metric("设定 DO", f"{sim['do'][-1]:.2f} mg/L")
+                with am3:
+                    st.metric("风机频率", f"{sim['freq'][-1]:.1f} Hz")
+                with am4:
+                    st.metric("实时功率", f"{sim['power'][-1]:.1f} kW")
 
-            # 当前指标
-            am1, am2, am3, am4 = st.columns(4)
-            with am1:
-                st.metric("进水氨氮", f"{sim['nh3'][-1]:.1f} mg/L")
-            with am2:
-                st.metric("设定 DO", f"{sim['do'][-1]:.2f} mg/L")
-            with am3:
-                st.metric("风机频率", f"{sim['freq'][-1]:.1f} Hz")
-            with am4:
-                st.metric("实时功率", f"{sim['power'][-1]:.1f} kW")
+                # 出水达标判定
+                tn_now = sim['tn'][-1]
+                if tn_now <= 15:
+                    st.success(f"✅ 出水 TN {tn_now:.1f} mg/L 达标（≤15 mg/L）")
+                else:
+                    st.warning(f"⚠️ 出水 TN {tn_now:.1f} mg/L 接近超标，建议提高 DO")
 
-            # 出水达标判定
-            tn_now = sim['tn'][-1]
-            if tn_now <= 15:
-                st.success(f"✅ 出水 TN {tn_now:.1f} mg/L 达标（≤15 mg/L）")
-            else:
-                st.warning(f"⚠️ 出水 TN {tn_now:.1f} mg/L 接近超标，建议提高 DO")
+                # 趋势图（也搬进 fragment，否则也不刷新）
+                df_sim = pd.DataFrame({
+                    '帧': sim['t'], '进水氨氮': sim['nh3'], 'DO': sim['do'], '出水TN': sim['tn'],
+                    '风机频率': sim['freq'], 'AI功率': sim['power'], '传统功率': sim['base_power']
+                })
+                if go is not None and len(df_sim) > 1:
+                    st.markdown("##### 功率对比（kW）")
+                    fig_p = go.Figure()
+                    fig_p.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['AI功率'], name='AI 变频功率'))
+                    fig_p.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['传统功率'], name='传统恒速功率'))
+                    fig_p.update_layout(height=280, margin=dict(t=10, b=60, l=50, r=20),
+                                        yaxis=dict(title='功率 (kW)'),
+                                        legend=dict(orientation='h', yanchor='top', y=-0.18))
+                    st.plotly_chart(fig_p, use_container_width=True)
+                else:
+                    st.line_chart(df_sim.set_index('帧')[['AI功率', '传统功率']])
 
-            # 趋势图
-            df_sim = pd.DataFrame({
-                '帧': sim['t'], '进水氨氮': sim['nh3'], 'DO': sim['do'], '出水TN': sim['tn'],
-                '风机频率': sim['freq'], 'AI功率': sim['power'], '传统功率': sim['base_power']
-            })
-            if go is not None and len(df_sim) > 1:
-                st.markdown("##### 功率对比（kW）")
-                fig_p = go.Figure()
-                fig_p.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['AI功率'], name='AI 变频功率'))
-                fig_p.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['传统功率'], name='传统恒速功率'))
-                fig_p.update_layout(height=280, margin=dict(t=10, b=60, l=50, r=20),
-                                    yaxis=dict(title='功率 (kW)'),
-                                    legend=dict(orientation='h', yanchor='top', y=-0.18))
-                st.plotly_chart(fig_p, use_container_width=True)
-            else:
-                st.line_chart(df_sim.set_index('帧')[['AI功率', '传统功率']])
+            _aero_live()
 
         # 药剂成本
         with tab2:
@@ -2873,27 +3083,34 @@ if st is not None:
         </div>
         """, unsafe_allow_html=True)
 
-        # 实时微波动：自动刷新 + 平滑抖动（幅度 <1.5%，仅影响展示，不写 CSV）
+        # 实时微波动：自动刷新 + 平滑抖动（幅度 <4.5%，仅影响展示，不写 CSV）
         import math, time, random as _rd
-        def _jit(v, rel=0.014):
+        def _jit(v, rel=0.045):
             _t = time.time()
             _slow = 0.5 * rel * math.sin(_t / 30.0)      # 慢漂移
             _noise = rel * (_rd.random() * 2 - 1) * 0.5  # 轻微随机噪声
             return float(v) * (1.0 + _slow + _noise)
+        # v13: dashboard 整页 2 s 自动重跑让 _jit() 抖动值实时变化；rel 加大到 4.5% 使
+        # NH₃-N / TP 等小数值在 2 位小数显示下也能肉眼可见地跳动。
+        # streamlit-autorefresh 包已装在系统 Python：1.0.1；每次 interval 毫秒后自动 st.rerun()。
+        # 失败回退到 st.fragment(run_every=2) 触发整页重跑。
         try:
             from streamlit_autorefresh import st_autorefresh
             st_autorefresh(interval=2000, key="dash_ar")
         except Exception:
-            pass
+            @st.fragment(run_every=2)
+            def _dash_live_tick():
+                st.rerun(scope="app")
+            _dash_live_tick()
 
         # 优先使用真实/演示数据；若不存在则回退到基础参数
         if os.path.exists(SAMPLE_CSV):
             df_flow = pd.read_csv(SAMPLE_CSV)
-            df_flow["时间"] = pd.to_datetime(df_flow["时间"])
-            latest = df_flow.iloc[-1]
         else:
             df_flow = _build_sample_df()
-            latest = df_flow.iloc[-1]
+        # 两种来源统一把"时间"列规整为 datetime，避免下游 .dt 访问报错（趋势图）
+        df_flow["时间"] = pd.to_datetime(df_flow["时间"], errors="coerce")
+        latest = df_flow.iloc[-1]
 
         bp = st.session_state.base_params
         Q_avg = _jit(latest.get("进水流量(m3/h)", bp.get("Q_actual", 20000) / 24.0))
@@ -2928,10 +3145,10 @@ if st is not None:
         nh3_in = _jit(latest.get("进水NH3-N(mg/L)", 0))
         tn_in = _jit(latest.get("进水TN(mg/L)", 0))
         tp_in = _jit(latest.get("进水TP(mg/L)", 0))
-        cod_out = _jit(latest.get("出水COD(mg/L)", 12.0))
-        tn_out = _jit(latest.get("出水TN(mg/L)", 7.0))
-        nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0.5))
-        tp_out = _jit(latest.get("出水TP(mg/L)", 0.12))
+        cod_out = _jit(latest.get("出水COD(mg/L)", 15.0))
+        tn_out = _jit(latest.get("出水TN(mg/L)", 7.5))
+        nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0.75))
+        tp_out = _jit(latest.get("出水TP(mg/L)", 0.15))
         tmp = _jit(8.48)
         score = 100
         if cod_out > 30: score -= 15
@@ -2981,13 +3198,13 @@ if st is not None:
             _alarm_msgs = []
             _diag_actions = []
             if cod_out > 30:
-                _alarm_msgs.append(f"出水 COD 超标：{cod_out:.1f} mg/L（限值 30）")
+                _alarm_msgs.append(f"出水 COD 超标：{cod_out:.2f} mg/L（限值 30）")
                 _diag_actions.append("排查进水有机负荷冲击，提高曝气量或延长 SRT")
             if tn_out > 15:
                 _alarm_msgs.append(f"出水 TN 超标：{tn_out:.2f} mg/L（限值 15）")
                 _diag_actions.append("提高内回流比 R1，必要时投加外碳源")
-            if nh3_out > 1.5:
-                _alarm_msgs.append(f"出水 NH₃-N 超标：{nh3_out:.2f} mg/L（限值 1.5）")
+            if nh3_out > 0.45:
+                _alarm_msgs.append(f"出水 NH₃-N 超标：{nh3_out:.3f} mg/L（限值 0.45）")
                 _diag_actions.append("提高好氧段 DO，检查硝化菌活性")
             if tp_out > 0.3:
                 _alarm_msgs.append(f"出水 TP 超标：{tp_out:.3f} mg/L（限值 0.3）")
@@ -3149,15 +3366,15 @@ if st is not None:
             nh3_in = _jit(latest.get("进水NH3-N(mg/L)", 0))
             tn_in = _jit(latest.get("进水TN(mg/L)", 0))
             tp_in = _jit(latest.get("进水TP(mg/L)", 0))
-            cod_out = _jit(latest.get("出水COD(mg/L)", 12.0))
-            nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0.5))
-            tn_out = _jit(latest.get("出水TN(mg/L)", 7.0))
-            tp_out = _jit(latest.get("出水TP(mg/L)", 0.12))
+            cod_out = _jit(latest.get("出水COD(mg/L)", 15.0))
+            nh3_out = _jit(latest.get("出水NH3-N(mg/L)", 0.225))
+            tn_out = _jit(latest.get("出水TN(mg/L)", 7.5))
+            tp_out = _jit(latest.get("出水TP(mg/L)", 0.15))
 
             _out_rows = [
                 ("COD (mg/L)", cod_out, 30.0, _ok(cod_out, 30)),
-                ("NH₃-N (mg/L)", nh3_out, 1.5, _ok(nh3_out, 1.5)),
-                ("TN (mg/L)", tn_out, 15.0, _ok(tn_out, 15)),
+                ("NH₃-N (mg/L)", nh3_out, 0.45, _ok(nh3_out, 0.45)),
+                ("TN (mg/L)", tn_out, 15.0, _ok(tn_out, 15.0)),
                 ("TP (mg/L)", tp_out, 0.3, _ok(tp_out, 0.3)),
             ]
             _in_html = (
@@ -3172,12 +3389,12 @@ if st is not None:
             )
             st.markdown(_in_html, unsafe_allow_html=True)
 
-            _out_html = '<div class="cp-panel"><div class="cp-title">🟩 出水实时水质 <small>准IV类</small></div>'
+            _out_html = '<div class="cp-panel"><div class="cp-title">🟩 出水实时水质 <small>准四类</small></div>'
             for _nm, _v, _lim, _isok in _out_rows:
                 _col = "#22c55e" if _isok else "#ef4444"
                 _out_html += (
                     f'<div class="cp-kv"><span>{_nm}</span>'
-                    f'<b style="color:{_col}">{_v:.2f} / {_lim:.1f}</b></div>'
+                    f'<b style="color:{_col}">{_v:.2f} / {_lim:.2f}</b></div>'
                 )
             _out_html += '</div>'
             st.markdown(_out_html, unsafe_allow_html=True)
@@ -3312,7 +3529,7 @@ if st is not None:
         _compliance = (
             df_flow.tail(24).apply(
                 lambda r: (r["出水COD(mg/L)"] <= 30 and r["出水TN(mg/L)"] <= 15 and
-                           r["出水NH3-N(mg/L)"] <= 1.5 and r["出水TP(mg/L)"] <= 0.3), axis=1
+                           r["出水NH3-N(mg/L)"] <= 0.45 and r["出水TP(mg/L)"] <= 0.3), axis=1
             ).mean() * 100
         ) if len(df_flow) >= 24 else 100.0
         _flow_latest = latest.get("进水流量(m3/h)", 833.0)
