@@ -2216,8 +2216,10 @@ if st is not None:
         # 关键改动：把"采集下一帧 / 自动滚动 checkbox / 4 个指标 metric / 报警文案"
         # 全部塞进同一个 @st.fragment(run_every=1.5)，避免 v12 时 fragment 内只推进数据、
         # 但 4 个 metric 在 fragment 外、run_every 不触发整页 rerun → 数值看似"不刷新"的 bug。
-        @st.fragment(run_every=1.5)
+        @st.fragment(run_every=2)
         def _uf_live():
+            if page != "💠 浸没式超滤工况":
+                return
             # 先按需推进一帧（首次或自动滚动开启时）
             if not sim['t']:
                 uf_step()
@@ -2246,6 +2248,11 @@ if st is not None:
             aer_now = sim['aer'][-1]
             turb_now = sim['turb'][-1]
             delta = tmp_now - sim['tmp'][-2] if len(sim['tmp']) > 1 else None
+            # 把派生指标写进 session_state，供 fragment 外的「⑤ AI 预测」区块读取（避免 NameError）
+            st.session_state['uf_aer'] = aer_now
+            st.session_state['uf_turb'] = turb_now
+            st.session_state['uf_tmp'] = tmp_now
+            st.session_state['uf_flux'] = flux_now
 
             st.markdown("---")
             st.subheader("③ 当前实时指标与预警")
@@ -2267,97 +2274,103 @@ if st is not None:
             else:
                 st.success(f"✅ 工况正常：TMP 距 CEB 阈值尚有 {ceb_thr - tmp_now:.1f} kPa 余量")
 
-        _uf_live()
 
-        # ---------- ④ 运行趋势 ----------
-        st.markdown("---")
-        st.subheader("④ 运行趋势")
-        df = pd.DataFrame({'帧': sim['t'], 'TMP(kPa)': sim['tmp'], '通量(LMH)': sim['flux'],
-                           '曝气(m³/m²·h)': sim['aer'], '浊度(NTU)': sim['turb']})
-        if go is not None:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df['帧'], y=df['TMP(kPa)'], name='TMP', line=dict(color='#0e7490', width=2)))
-            fig.add_hline(y=ceb_thr, line=dict(color='#d97706', dash='dash'),
-                          annotation_text='CEB阈值', annotation_position='top left')
-            fig.add_hline(y=tmp_alarm, line=dict(color='#dc2626', dash='dash'),
-                          annotation_text='报警限值', annotation_position='top left')
-            fig.update_layout(height=320, margin=dict(t=20, b=40, l=40, r=20), legend=dict(orientation='h'))
-            st.plotly_chart(fig, use_container_width=True)
-            fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(x=df['帧'], y=df['通量(LMH)'], name='通量', yaxis='y1'))
-            fig2.add_trace(go.Scatter(x=df['帧'], y=df['曝气(m³/m²·h)'], name='曝气', yaxis='y1'))
-            fig2.add_trace(go.Scatter(x=df['帧'], y=df['浊度(NTU)'], name='浊度', yaxis='y2'))
-            fig2.update_layout(height=300, margin=dict(t=20, b=40, l=40, r=40),
-                               yaxis=dict(title='通量/曝气'),
-                               yaxis2=dict(title='浊度(NTU)', overlaying='y', side='right', range=[0, 0.1]))
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.line_chart(df.set_index('帧')[['TMP(kPa)', '通量(LMH)', '曝气(m³/m²·h)', '浊度(NTU)']])
-
-        # ---------- ⑤ AI 预测与运维指导 ----------
-        st.markdown("---")
-        st.subheader("⑤ AI 预测与运维指导")
-        n = len(sim['tmp'])
-        # 稳定斜率：取近 30 帧帧间增量的中位数，抑制单帧噪声导致的预测跳动
-        if n >= 10:
-            win = min(n, 30)
-            _inc = np.diff(sim['tmp'][-win:])
-            slope = float(np.median(_inc)) if len(_inc) else 0.0
-        else:
-            slope = 0.0
-        pred_lines = []
-        if n < 10:
-            pred_lines.append("- 样本不足（需≥10帧），继续采集以稳定 CEB/报警预测。")
-        elif slope > 1e-4:
-            frames_to_ceb = (ceb_thr - tmp_now) / slope
-            frames_to_alarm = (tmp_alarm - tmp_now) / slope
-            pred_lines.append(
+            # ---------- ④ 运行趋势 ----------
+            st.markdown("---")
+            st.subheader("④ 运行趋势")
+            df = pd.DataFrame({'帧': sim['t'], 'TMP(kPa)': sim['tmp'], '通量(LMH)': sim['flux'],
+                               '曝气(m³/m²·h)': sim['aer'], '浊度(NTU)': sim['turb']})
+            if go is not None:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=df['帧'], y=df['TMP(kPa)'], name='TMP', line=dict(color='#0e7490', width=2)))
+                fig.add_hline(y=ceb_thr, line=dict(color='#d97706', dash='dash'),
+                              annotation_text='CEB阈值', annotation_position='top left')
+                fig.add_hline(y=tmp_alarm, line=dict(color='#dc2626', dash='dash'),
+                              annotation_text='报警限值', annotation_position='top left')
+                fig.update_layout(height=320, margin=dict(t=20, b=40, l=40, r=20), legend=dict(orientation='h'))
+                st.plotly_chart(fig, use_container_width=True)
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(x=df['帧'], y=df['通量(LMH)'], name='通量', yaxis='y1'))
+                fig2.add_trace(go.Scatter(x=df['帧'], y=df['曝气(m³/m²·h)'], name='曝气', yaxis='y1'))
+                fig2.add_trace(go.Scatter(x=df['帧'], y=df['浊度(NTU)'], name='浊度', yaxis='y2'))
+                fig2.update_layout(height=300, margin=dict(t=20, b=40, l=40, r=40),
+                                   yaxis=dict(title='通量/曝气'),
+                                   yaxis2=dict(title='浊度(NTU)', overlaying='y', side='right', range=[0, 0.1]))
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.line_chart(df.set_index('帧')[['TMP(kPa)', '通量(LMH)', '曝气(m³/m²·h)', '浊度(NTU)']])
+    
+            # ---------- ⑤ AI 预测与运维指导 ----------
+            # 从 session_state 读取 fragment 内实时计算的派生指标（避免 NameError）
+            aer_now = st.session_state.get('uf_aer', 0.0)
+            turb_now = st.session_state.get('uf_turb', 0.0)
+            tmp_now = st.session_state.get('uf_tmp', 0.0)
+            flux_now = st.session_state.get('uf_flux', 0.0)
+            st.markdown("---")
+            st.subheader("⑤ AI 预测与运维指导")
+            n = len(sim['tmp'])
+            # 稳定斜率：取近 30 帧帧间增量的中位数，抑制单帧噪声导致的预测跳动
+            if n >= 10:
+                win = min(n, 30)
+                _inc = np.diff(sim['tmp'][-win:])
+                slope = float(np.median(_inc)) if len(_inc) else 0.0
+            else:
+                slope = 0.0
+            pred_lines = []
+            if n < 10:
+                pred_lines.append("- 样本不足（需≥10帧），继续采集以稳定 CEB/报警预测。")
+            elif slope > 1e-4:
+                frames_to_ceb = (ceb_thr - tmp_now) / slope
+                frames_to_alarm = (tmp_alarm - tmp_now) / slope
+                pred_lines.append(
                 f"- **CEB 反洗预测**：按当前上升趋势（≈{slope:.3f} kPa/帧，基于近{min(n,30)}帧中位增量），"
                 f"约 **{max(frames_to_ceb, 0):.0f} 帧**后达到 CEB 阈值（{ceb_thr:.0f} kPa），"
                 f"约合 **{max(frames_to_ceb, 0)/24:.1f} 天**（按 24 帧/天计）。")
-            if frames_to_alarm > 0:
-                pred_lines.append(
+                if frames_to_alarm > 0:
+                    pred_lines.append(
                     f"- **报警预测**：约 **{frames_to_alarm:.0f} 帧**后触及报警限值（{tmp_alarm:.0f} kPa），"
                     f"约合 **{frames_to_alarm/24:.1f} 天**；请在报警前完成 CEB。")
+                else:
+                    pred_lines.append("- **报警预测**：当前 TMP 已超过报警限值，需立即处置。")
             else:
-                pred_lines.append("- **报警预测**：当前 TMP 已超过报警限值，需立即处置。")
-        else:
-            pred_lines.append("- 当前 TMP 趋势平稳（斜率≈0），未见明显污染上升，维持现有维护性清洗周期即可。")
-
-        anomalies = []
-        if aer_now < 60:
-            anomalies.append("曝气强度低于 60 m³/(m²·h)，膜面剪切不足，易加速污染——建议提高曝气。")
-        elif aer_now > 70:
-            anomalies.append("曝气强度高于 70，能耗偏高但利于控污——可酌情下调。")
-        if turb_now > 0.06:
-            anomalies.append("出水浊度 >0.06 NTU，疑似膜丝破损或断丝——建议做完整性检测。")
-        if tmp_now >= ceb_thr and slope > 0:
-            anomalies.append("TMP 已超 CEB 阈值且仍在上升，判断为可逆污染主导，优先 CEB（次氯酸钠/柠檬酸）而非 CIP。")
-
-        st.info("**AI 趋势预测（机理+统计）**\n" + "\n".join(pred_lines))
-        if anomalies:
-            st.warning("**AI 异常诊断（规则引擎）**\n- " + "\n- ".join(anomalies))
-        else:
-            st.success("**AI 异常诊断**：各参数均在正常波动区间，未发现异常。")
-
-        # 高阶 AI：调用大模型生成自然语言运维建议（需配置 GLM-4-Flash 等，离线时自动降级规则引擎）
-        _llm_mode = st.session_state.get('_llm_status', ('offline',))[0]
-        st.caption(f"AI 能力档位：当前为「{_llm_mode}」模式"
-                   f"（offline=离线规则引擎；local/cloud=已接入大模型，可生成自然语言诊断报告）")
-        if st.button("🤖 调用大模型生成运维诊断报告", key="uf_ai"):
-            ctx = (f"现场信息：UF设计水量{Q_uf:.0f} m³/d，已安装膜面积{area_installed:.0f} m²，"
-                   f"回收率{recovery:.0f}%，已连续运行{run_days:.0f}天。\n"
-                   f"当前实时：通量{flux_now:.1f} LMH，TMP{tmp_now:.2f} kPa（CEB阈值{ceb_thr:.0f}，报警{tmp_alarm:.0f}），"
-                   f"曝气{aer_now:.1f} m³/(m²·h)，出水浊度{turb_now:.3f} NTU。\n"
-                   f"TMP趋势斜率≈{slope:.3f} kPa/帧。")
-            q = ("请作为膜法水处理工程师，给出：1) TMP 上升的根因判断；2) 是否需要及何时安排 CEB 反洗；"
-                 "3) 具体清洗配方与运行调整建议；4) 防止进一步污染的措施。语言简洁专业。")
-            out = st.empty()
-            text = ""
-            for piece in ai_assistant_stream(q, ctx, kb_dir=None):
-                text += piece
-                out.markdown(text)
-
+                pred_lines.append("- 当前 TMP 趋势平稳（斜率≈0），未见明显污染上升，维持现有维护性清洗周期即可。")
+    
+            anomalies = []
+            if aer_now < 60:
+                anomalies.append("曝气强度低于 60 m³/(m²·h)，膜面剪切不足，易加速污染——建议提高曝气。")
+            elif aer_now > 70:
+                anomalies.append("曝气强度高于 70，能耗偏高但利于控污——可酌情下调。")
+            if turb_now > 0.06:
+                anomalies.append("出水浊度 >0.06 NTU，疑似膜丝破损或断丝——建议做完整性检测。")
+            if tmp_now >= ceb_thr and slope > 0:
+                anomalies.append("TMP 已超 CEB 阈值且仍在上升，判断为可逆污染主导，优先 CEB（次氯酸钠/柠檬酸）而非 CIP。")
+    
+            st.info("**AI 趋势预测（机理+统计）**\n" + "\n".join(pred_lines))
+            if anomalies:
+                st.warning("**AI 异常诊断（规则引擎）**\n- " + "\n- ".join(anomalies))
+            else:
+                st.success("**AI 异常诊断**：各参数均在正常波动区间，未发现异常。")
+    
+            # 高阶 AI：调用大模型生成自然语言运维建议（需配置 GLM-4-Flash 等，离线时自动降级规则引擎）
+            _llm_mode = st.session_state.get('_llm_status', ('offline',))[0]
+            st.caption(f"AI 能力档位：当前为「{_llm_mode}」模式"
+            f"（offline=离线规则引擎；local/cloud=已接入大模型，可生成自然语言诊断报告）")
+            if st.button("🤖 调用大模型生成运维诊断报告", key="uf_ai"):
+                ctx = (f"现场信息：UF设计水量{Q_uf:.0f} m³/d，已安装膜面积{area_installed:.0f} m²，"
+                f"回收率{recovery:.0f}%，已连续运行{run_days:.0f}天。\n"
+                f"当前实时：通量{flux_now:.1f} LMH，TMP{tmp_now:.2f} kPa（CEB阈值{ceb_thr:.0f}，报警{tmp_alarm:.0f}），"
+                f"曝气{aer_now:.1f} m³/(m²·h)，出水浊度{turb_now:.3f} NTU。\n"
+                f"TMP趋势斜率≈{slope:.3f} kPa/帧。")
+                q = ("请作为膜法水处理工程师，给出：1) TMP 上升的根因判断；2) 是否需要及何时安排 CEB 反洗；"
+                "3) 具体清洗配方与运行调整建议；4) 防止进一步污染的措施。语言简洁专业。")
+                out = st.empty()
+                text = ""
+                for piece in ai_assistant_stream(q, ctx, kb_dir=None):
+                    text += piece
+                    out.markdown(text)
+    
+    
+        _uf_live()
 
     # ================= 页面6：成本经济核算 =================
     elif page == "💰 成本经济核算":
@@ -2482,6 +2495,8 @@ if st is not None:
             # metric 与图表在 fragment 外，run_every 不触发整页 rerun → 数值看似"不刷新"。
             @st.fragment(run_every=3)
             def _aero_live():
+                if page != "💰 成本经济核算":
+                    return
                 # 数据推进（首次或勾选自动滚动时）
                 if not sim['t']:
                     aero_step()
