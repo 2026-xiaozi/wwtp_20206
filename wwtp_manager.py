@@ -1154,7 +1154,7 @@ if st is not None:
             形状精确（顶部圆、底部尖、白色高光），不受 sub-pixel 影响。 */
             .tb-drop{
             width:16px; height:20px;
-            background-image:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAzMCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMCIgeTE9IjAiIHgyPSIwIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjRkZGRkZGIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjRTBFQUZBIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggZD0iTTEyIDEuNSBDIDEyIDEuNSwgMiAxNCwgMiAxOS41IEMgMiAyNC43LCA2LjUgMjguNSwgMTIgMjguNSBDIDE3LjUgMjguNSwgMjIgMjQuNywgMjIgMTkuNSBDIDIyIDE0LCAxMiAxLjUsIDEyIDEuNSBaIiBmaWxsPSJ1cmwoI2cpIi8+PGVsbGlwc2UgY3g9IjgiIGN5PSIxMCIgcng9IjIuNiIgcnk9IjIuMiIgZmlsbD0icmdiYSgyNTUsMjU1LDI1NSwwLjg1KSIvPjwvc3ZnPg==");
+            background-image:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAzMCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMCIgeTE9IjAiIHgyPSIwIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjRkZGRkZGIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjRTBFQUZBIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggZD0iTTEyIDEuNSBDIDEyIDEuNSwgMiAxNCwgMiAxOS41IEMgMiAyNC43LCA2LjUgMjguNSwgMTIgMjguNSBDIDE3LjUgMjguNSwgMjIgMjQuNywgMjIgMTkuNSBDIDIyIDE0LCAxMiAxLjUsIDEyIDEuNSBaIiBmaWxsPSJ1cmwoI2cpIi8+PC9zdmc+");
             background-repeat:no-repeat;
             background-size:contain;
             background-position:center;
@@ -1266,7 +1266,7 @@ if st is not None:
             }
             /* 纯 CSS 白水滴 v10：与 .tb-drop 同一 SVG 资源，仅尺寸更大、阴影更明显 */
             .login-drop{ position:relative; width:28px; height:34px;
-            background-image:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAzMCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMCIgeTE9IjAiIHgyPSIwIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjRkZGRkZGIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjRDhFNUY4Ii8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggZD0iTTEyIDEuNSBDIDEyIDEuNSwgMiAxNCwgMiAxOS41IEMgMiAyNC43LCA2LjUgMjguNSwgMTIgMjguNSBDIDE3LjUgMjguNSwgMjIgMjQuNywgMjIgMTkuNSBDIDIyIDE0LCAxMiAxLjUsIDEyIDEuNSBaIiBmaWxsPSJ1cmwoI2cpIi8+PGVsbGlwc2UgY3g9IjgiIGN5PSIxMCIgcng9IjIuNiIgcnk9IjIuMiIgZmlsbD0icmdiYSgyNTUsMjU1LDI1NSwwLjkpIi8+PC9zdmc+");
+            background-image:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAzMCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMCIgeTE9IjAiIHgyPSIwIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjRkZGRkZGIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjRDhFNUY4Ii8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggZD0iTTEyIDEuNSBDIDEyIDEuNSwgMiAxNCwgMiAxOS41IEMgMiAyNC43LCA2LjUgMjguNSwgMTIgMjguNSBDIDE3LjUgMjguNSwgMjIgMjQuNywgMjIgMTkuNSBDIDIyIDE0LCAxMiAxLjUsIDEyIDEuNSBaIiBmaWxsPSJ1cmwoI2cpIi8+PC9zdmc+");
             background-repeat:no-repeat;
             background-size:contain;
             background-position:center;
