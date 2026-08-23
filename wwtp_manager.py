@@ -5,8 +5,10 @@ import os
 import re
 try:
     import streamlit as st
+    from streamlit.components.v1 import html as _st_html
 except ImportError:
     st = None
+    _st_html = None
 try:
     import pandas as pd
 except ImportError:
@@ -1477,6 +1479,29 @@ if st is not None:
     ]
     plt.rcParams["axes.unicode_minus"] = False
 
+    # ---- 侧边栏保底：若被浏览器 localStorage 记录为"收起"（如微信内置浏览器收起后刷新无法恢复），
+    # 加载时自动展开并改写 localStorage，确保导航栏始终可见。无可见 UI，纯兜底纠正，不改变默认交互。
+    # 注意：st.markdown 注入的 <script> 会被 Streamlit 净化剥离，故改用 components.html（iframe 内脚本可
+    # 执行且同源可访问父页面 DOM）来点击展开箭头；height=0 使其不可见。 ----
+    # 侧边栏保底脚本只需在会话首次进入时纠正一次（改写 localStorage 后即持久），
+    # 用 session_state 守卫避免每次重跑/每次刷新都新建 iframe（线上每次交互都走网络，能省则省）。
+    if _st_html is not None and not st.session_state.get("_sb_fixed_done", False):
+        _st_html(
+            "<script>(function(){"
+            "function te(){"
+            "  var s=window.parent.document.querySelector('[data-testid=\"stSidebar\"]');"
+            "  if(!s)return false;"
+            "  if(s.getBoundingClientRect().width>50)return true;"
+            "  var b=Array.prototype.slice.call(window.parent.document.querySelectorAll('button'));"
+            "  var r=b.find(function(x){return (x.textContent||'')==='keyboard_double_arrow_right';});"
+            "  if(r){r.click();return true;}return false;"
+            "}"
+            "var n=0,iv=setInterval(function(){try{if(te())clearInterval(iv);}catch(e){}"
+            "if(++n>15)clearInterval(iv);},300);"
+            "})();</script>",
+            height=0, scrolling=False)
+        st.session_state["_sb_fixed_done"] = True
+
     # 计算结果 schema 版本号：用于识别 session_state 中残留的旧版计算结果。
     # 代码更新后，旧 dict 可能缺少新字段（如 bio['R']），据此安全提示重算而非崩溃。
     RESULT_SCHEMA = "2026-08-08"
@@ -2316,6 +2341,8 @@ if st is not None:
                 slope = float(np.median(_inc)) if len(_inc) else 0.0
             else:
                 slope = 0.0
+            # 把 slope 写进 session_state，供 fragment 外的「⑤ 大模型诊断」按钮读取（避免 NameError / 作用域问题）
+            st.session_state['uf_slope'] = slope
             pred_lines = []
             if n < 10:
                 pred_lines.append("- 样本不足（需≥10帧），继续采集以稳定 CEB/报警预测。")
@@ -2350,27 +2377,35 @@ if st is not None:
                 st.warning("**AI 异常诊断（规则引擎）**\n- " + "\n- ".join(anomalies))
             else:
                 st.success("**AI 异常诊断**：各参数均在正常波动区间，未发现异常。")
-    
-            # 高阶 AI：调用大模型生成自然语言运维建议（需配置 GLM-4-Flash 等，离线时自动降级规则引擎）
-            _llm_mode = st.session_state.get('_llm_status', ('offline',))[0]
-            st.caption(f"AI 能力档位：当前为「{_llm_mode}」模式"
-            f"（offline=离线规则引擎；local/cloud=已接入大模型，可生成自然语言诊断报告）")
-            if st.button("🤖 调用大模型生成运维诊断报告", key="uf_ai"):
-                ctx = (f"现场信息：UF设计水量{Q_uf:.0f} m³/d，已安装膜面积{area_installed:.0f} m²，"
-                f"回收率{recovery:.0f}%，已连续运行{run_days:.0f}天。\n"
-                f"当前实时：通量{flux_now:.1f} LMH，TMP{tmp_now:.2f} kPa（CEB阈值{ceb_thr:.0f}，报警{tmp_alarm:.0f}），"
-                f"曝气{aer_now:.1f} m³/(m²·h)，出水浊度{turb_now:.3f} NTU。\n"
-                f"TMP趋势斜率≈{slope:.3f} kPa/帧。")
-                q = ("请作为膜法水处理工程师，给出：1) TMP 上升的根因判断；2) 是否需要及何时安排 CEB 反洗；"
-                "3) 具体清洗配方与运行调整建议；4) 防止进一步污染的措施。语言简洁专业。")
-                out = st.empty()
-                text = ""
-                for piece in ai_assistant_stream(q, ctx, kb_dir=None):
-                    text += piece
-                    out.markdown(text)
-    
-    
+
+
         _uf_live()
+
+        # ---------- ⑤ 高阶 AI：大模型运维诊断报告（置于 fragment 之外） ----------
+        # 说明：若把"调用大模型"按钮写在上面的 _uf_live() fragment 内，会被 run_every=2 的
+        # 定时重跑每 2 秒清空/重置，导致"点击后回答一闪而过、按钮状态丢失"。故将其移出 fragment，
+        # 作为本页静态区块；实时数据从 session_state（由 fragment 每 2s 写入）读取，保证回答稳定留存。
+        _llm_mode = st.session_state.get('_llm_status', ('offline',))[0]
+        st.caption(f"AI 能力档位：当前为「{_llm_mode}」模式"
+                   f"（offline=离线规则引擎；local/cloud=已接入大模型，可生成自然语言诊断报告）")
+        if st.button("🤖 调用大模型生成运维诊断报告", key="uf_ai"):
+            _flux = st.session_state.get('uf_flux', 0.0)
+            _tmp = st.session_state.get('uf_tmp', 0.0)
+            _aer = st.session_state.get('uf_aer', 0.0)
+            _turb = st.session_state.get('uf_turb', 0.0)
+            _slope = st.session_state.get('uf_slope', 0.0)
+            ctx = (f"现场信息：UF设计水量{Q_uf:.0f} m³/d，已安装膜面积{area_installed:.0f} m²，"
+                   f"回收率{recovery:.0f}%，已连续运行{run_days:.0f}天。\n"
+                   f"当前实时：通量{_flux:.1f} LMH，TMP{_tmp:.2f} kPa（CEB阈值{ceb_thr:.0f}，报警{tmp_alarm:.0f}），"
+                   f"曝气{_aer:.1f} m³/(m²·h)，出水浊度{_turb:.3f} NTU。\n"
+                   f"TMP趋势斜率≈{_slope:.3f} kPa/帧。")
+            q = ("请作为膜法水处理工程师，给出：1) TMP 上升的根因判断；2) 是否需要及何时安排 CEB 反洗；"
+                 "3) 具体清洗配方与运行调整建议；4) 防止进一步污染的措施。语言简洁专业。")
+            out = st.empty()
+            text = ""
+            for piece in ai_assistant_stream(q, ctx, kb_dir=None):
+                text += piece
+                out.markdown(text)
 
     # ================= 页面6：成本经济核算 =================
     elif page == "💰 成本经济核算":
@@ -3102,31 +3137,99 @@ if st is not None:
         </div>
         """, unsafe_allow_html=True)
 
-        # 实时微波动：自动刷新 + 平滑抖动（幅度 <4.5%，仅影响展示，不写 CSV）
+        # 实时微波动：改为「客户端 JS 抖动」——服务端只渲染稳定基准值，不再整页自动重跑。
+        # 浏览器端 setInterval 每 1.5s 对带 class="jit" 的数字加 ±3% 平滑噪声（慢漂移+随机），
+        # 观感与原一致，但彻底消除整页重跑带来的残影/灰屏/切换卡顿（线上零网络往返）。
         import math, time, random as _rd
-        def _jit(v, rel=0.045):
-            _t = time.time()
-            _slow = 0.5 * rel * math.sin(_t / 30.0)      # 慢漂移
-            _noise = rel * (_rd.random() * 2 - 1) * 0.5  # 轻微随机噪声
-            return float(v) * (1.0 + _slow + _noise)
-        # v13: dashboard 整页 2 s 自动重跑让 _jit() 抖动值实时变化；rel 加大到 4.5% 使
-        # NH₃-N / TP 等小数值在 2 位小数显示下也能肉眼可见地跳动。
-        # streamlit-autorefresh 包已装在系统 Python：1.0.1；每次 interval 毫秒后自动 st.rerun()。
-        # 失败回退到 st.fragment(run_every=2) 触发整页重跑。
-        try:
-            from streamlit_autorefresh import st_autorefresh
-            st_autorefresh(interval=2000, key="dash_ar")
-        except Exception:
-            @st.fragment(run_every=2)
-            def _dash_live_tick():
-                st.rerun(scope="app")
-            _dash_live_tick()
+        def _jit(v, rel=0.03):
+            # 服务端逻辑值取稳定基准，不再抖动（score/告警/表盘/趋势均基于真实值，更专业稳定）。
+            return float(v)
 
-        # 优先使用真实/演示数据；若不存在则回退到基础参数
-        if os.path.exists(SAMPLE_CSV):
-            df_flow = pd.read_csv(SAMPLE_CSV)
-        else:
-            df_flow = _build_sample_df()
+        def _j(v, dec):
+            # 生成带基准值的标记 span，供客户端 JS 抖动。v 为数值，dec 为小数位数。
+            return f'<span class="jit" data-base="{v:.10f}" data-dec="{dec}">{v:.{dec}f}</span>'
+
+        # 客户端 JS 抖动脚本：在不可见 iframe 内 setInterval 更新父页面 .jit 数字（±3%）与顶部时钟。
+        if _st_html is not None:
+            _st_html(
+                """
+<script>
+(function(){
+  var rel = 0.03;
+  function p2(n){ return (n<10 ? '0':'') + n; }
+  setInterval(function(){
+    try {
+      var d = window.parent.document;
+      var t = Date.now()/1000;
+      var slow = 0.5 * rel * Math.sin(t/30.0);
+      // 同一基准值只算一次抖动，保证多个位置的同源数字一致
+      // （顶部KPI↔左面板进水/出水/流量↔底部KPI；左侧去除率卡片↔plotly仪表盘；顶部跨膜压差↔UF仪表盘）
+      var jcache = {};
+      function jval(baseStr){
+        if (jcache[baseStr] === undefined) {
+          var b = parseFloat(baseStr);
+          if (isNaN(b)) return null;
+          var noise = rel * (Math.random()*2 - 1) * 0.5;
+          jcache[baseStr] = b * (1 + slow + noise);
+        }
+        return jcache[baseStr];
+      }
+      var els = d.querySelectorAll('.jit');
+      for (var i=0; i<els.length; i++){
+        var el = els[i];
+        var baseStr = el.getAttribute('data-base');
+        var dec = parseInt(el.getAttribute('data-dec') || '0', 10);
+        var v = jval(baseStr);
+        if (v === null) continue;
+        el.textContent = v.toFixed(dec);
+      }
+      var clk = d.querySelector('.dash-clock');
+      if (clk){
+        var now = new Date();
+        clk.textContent = now.getFullYear()+'-'+p2(now.getMonth()+1)+'-'+p2(now.getDate())
+          +' '+p2(now.getHours())+':'+p2(now.getMinutes())+':'+p2(now.getSeconds());
+      }
+      // plotly 仪表盘：复用 jcache 与对应 .jit 卡片保持一致；综合指数trace[0]不动
+      var gb = d.getElementById('gauge-bases');
+      if (gb && window.parent.Plotly) {
+        var bC = jval(gb.getAttribute('data-cod-rem'));
+        var bT = jval(gb.getAttribute('data-tn-rem'));
+        var bM = jval(gb.getAttribute('data-tmp'));
+        if (bC !== null && bT !== null && bM !== null) {
+          var plots = d.querySelectorAll('.js-plotly-plot');
+          for (var pi=0; pi<plots.length; pi++) {
+            var gd = plots[pi];
+            if (gd && gd._fullData) {
+              var hasInd = false;
+              for (var k=0; k<gd._fullData.length; k++){
+                if (gd._fullData[k].type === 'indicator'){ hasInd = true; break; }
+              }
+              if (hasInd) {
+                try {
+                  window.parent.Plotly.restyle(gd, {value: [bC, bT, bM]}, [1,2,3]);
+                } catch(e){}
+                break;
+              }
+            }
+          }
+        }
+      }
+    } catch(e){}
+  }, 1500);
+})();
+</script>
+""",
+                height=0, width=0, scrolling=False)
+
+        # 优先使用真实/演示数据；若不存在则回退到基础参数。
+        # 演示数据静态，整段缓存到 session_state，避免驾驶舱每 2s 自动刷新都重复读盘
+        # （线上每次刷新都走网络往返，重复 I/O 会被明显放大）。
+        if "dash_flow_df" not in st.session_state:
+            if os.path.exists(SAMPLE_CSV):
+                st.session_state["dash_flow_df"] = pd.read_csv(SAMPLE_CSV)
+            else:
+                st.session_state["dash_flow_df"] = _build_sample_df()
+        df_flow = st.session_state["dash_flow_df"]
         # 两种来源统一把"时间"列规整为 datetime，避免下游 .dt 访问报错（趋势图）
         df_flow["时间"] = pd.to_datetime(df_flow["时间"], errors="coerce")
         latest = df_flow.iloc[-1]
@@ -3196,11 +3299,11 @@ if st is not None:
             # ---- 顶部 KPI 条（6 个关键数字） ----
             _达标率 = sum([cod_out <= 30, tn_out <= 15, nh3_out <= 1.5, tp_out <= 0.3]) / 4 * 100
             _kpi_items = [
-                ("处理水量", f"{Q_avg:.1f}", "m³/h", "#38bdf8"),
-                ("进水 COD", f"{cod_in:.0f}", "mg/L", "#a78bfa"),
-                ("出水 COD", f"{cod_out:.1f}", "mg/L", "#22c55e" if cod_out <= 30 else "#ef4444"),
-                ("跨膜压差", f"{tmp:.2f}", "kPa", "#f472b6"),
-                ("TN 去除率", f"{_rem(tn_in, tn_out):.1f}", "%", "#22d3ee"),
+                ("处理水量", _j(Q_avg, 1), "m³/h", "#38bdf8"),
+                ("进水 COD", _j(cod_in, 0), "mg/L", "#a78bfa"),
+                ("出水 COD", _j(cod_out, 2), "mg/L", "#22c55e" if cod_out <= 30 else "#ef4444"),
+                ("跨膜压差", _j(tmp, 2), "kPa", "#f472b6"),
+                ("TN 去除率", _j(_rem(tn_in, tn_out), 1), "%", "#22d3ee"),
                 ("运行天数", f"{_run_days}", "d", "#f472b6"),
             ]
             _kpi_html = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">'
@@ -3269,6 +3372,12 @@ if st is not None:
                 _tn_rem = _rem(tn_in, tn_out)
                 _nh3_rem = _rem(nh3_in, nh3_out)
 
+                # 仪表盘基准值（供客户端 JS 抖动 3 个仪表，综合运行指数保持 100 静态）
+                st.markdown(
+                    f'<div id="gauge-bases" style="display:none" '
+                    f'data-cod-rem="{_cod_rem:.10f}" data-tn-rem="{_tn_rem:.10f}" data-tmp="{tmp:.10f}"></div>',
+                    unsafe_allow_html=True)
+
                 fig_gauges = make_subplots(
                     rows=2, cols=2,
                     specs=[[{'type': 'indicator'}, {'type': 'indicator'}],
@@ -3298,7 +3407,7 @@ if st is not None:
                     mode="gauge+number",
                     value=_cod_rem,
                     title={"text": "COD 去除率", "font": {"size": 13, "color": "#e2e8f0"}},
-                    number={"font": {"size": 24, "color": "#22d3ee"}, "suffix": "%"},
+                    number={"font": {"size": 24, "color": "#22d3ee"}, "suffix": "%", "valueformat": ".1f"},
                     gauge={
                         "axis": {"range": [0, 100], "tickcolor": "#64748b", "tickfont": {"size": 9, "color": "#94a3b8"}},
                         "bar": {"color": "#22d3ee", "thickness": 0.75},
@@ -3315,7 +3424,7 @@ if st is not None:
                     mode="gauge+number",
                     value=_tn_rem,
                     title={"text": "TN 去除率", "font": {"size": 13, "color": "#e2e8f0"}},
-                    number={"font": {"size": 24, "color": "#a78bfa"}, "suffix": "%"},
+                    number={"font": {"size": 24, "color": "#a78bfa"}, "suffix": "%", "valueformat": ".1f"},
                     gauge={
                         "axis": {"range": [0, 100], "tickcolor": "#64748b", "tickfont": {"size": 9, "color": "#94a3b8"}},
                         "bar": {"color": "#a78bfa", "thickness": 0.75},
@@ -3332,7 +3441,7 @@ if st is not None:
                     mode="gauge+number",
                     value=tmp,
                     title={"text": "UF 跨膜压差", "font": {"size": 13, "color": "#e2e8f0"}},
-                    number={"font": {"size": 24, "color": "#f472b6"}, "suffix": " kPa"},
+                    number={"font": {"size": 24, "color": "#f472b6"}, "suffix": " kPa", "valueformat": ".2f"},
                     gauge={
                         "axis": {"range": [0, 50], "tickcolor": "#64748b", "tickfont": {"size": 9, "color": "#94a3b8"}},
                         "bar": {"color": "#f472b6", "thickness": 0.75},
@@ -3399,11 +3508,11 @@ if st is not None:
             _in_html = (
                 '<div class="cp-panel"><div class="cp-title">🟦 进水实时水质 '
                 '<small>LATEST</small></div>'
-                f'<div class="cp-kv"><span>COD</span><b>{cod_in:.0f}</b></div>'
-                f'<div class="cp-kv"><span>NH₃-N</span><b>{nh3_in:.1f}</b></div>'
-                f'<div class="cp-kv"><span>TN</span><b>{tn_in:.0f}</b></div>'
-                f'<div class="cp-kv"><span>TP</span><b>{tp_in:.2f}</b></div>'
-                f'<div class="cp-kv"><span>流量</span><b>{Q_avg:.1f} m³/h</b></div>'
+                f'<div class="cp-kv"><span>COD</span><b>{_j(cod_in, 0)}</b></div>'
+                f'<div class="cp-kv"><span>NH₃-N</span><b>{_j(nh3_in, 1)}</b></div>'
+                f'<div class="cp-kv"><span>TN</span><b>{_j(tn_in, 0)}</b></div>'
+                f'<div class="cp-kv"><span>TP</span><b>{_j(tp_in, 2)}</b></div>'
+                f'<div class="cp-kv"><span>流量</span><b>{_j(Q_avg, 1)} m³/h</b></div>'
                 '</div>'
             )
             st.markdown(_in_html, unsafe_allow_html=True)
@@ -3413,7 +3522,7 @@ if st is not None:
                 _col = "#22c55e" if _isok else "#ef4444"
                 _out_html += (
                     f'<div class="cp-kv"><span>{_nm}</span>'
-                    f'<b style="color:{_col}">{_v:.2f} / {_lim:.2f}</b></div>'
+                    f'<b style="color:{_col}">{_j(_v, 2)} / {_lim:.2f}</b></div>'
                 )
             _out_html += '</div>'
             st.markdown(_out_html, unsafe_allow_html=True)
@@ -3428,7 +3537,7 @@ if st is not None:
             for _nm, _p in _rem_rows:
                 _w = min(_p, 100)
                 _rem_html += (
-                    f'<div class="cp-kv"><span>{_nm}</span><b>{_p:.1f}%</b></div>'
+                    f'<div class="cp-kv"><span>{_nm}</span><b>{_j(_p, 1)}%</b></div>'
                     f'<div class="cp-bar"><i style="width:{_w:.0f}%"></i></div>'
                 )
             _rem_html += '</div>'
@@ -3449,7 +3558,7 @@ if st is not None:
                 ("内回流比 R1", f"{r1_pct:.0f}", "%", "#f472b6"),
                 ("污泥回流比 R2", "50–100", "%", "#eab308"),
                 ("SRT 污泥龄", f"{_srt:.1f}", "d", "#38bdf8"),
-                ("F/M 负荷", f"{_fm:.2f}", "kgCOD/(kg·d)", "#22c55e"),
+                ("F/M 负荷", _j(_fm, 2), "kgCOD/(kg·d)", "#22c55e"),
             ]
             _param_html = '<div class="cp-panel"><div class="cp-title">⚙️ 关键工艺参数 <small>KEY PARAMETERS</small></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">'
             for _pn, _pv, _pu, _pc in _param_rows:
@@ -3558,11 +3667,11 @@ if st is not None:
         _kg_m3 = (_chem_latest / _flow_latest) if _flow_latest > 0 else 0.0
         _kpi_html = (
             '<div class="kpi-strip">'
-            f'<div class="kpi-box"><div class="v">{Q_avg:.1f}</div><div class="l">处理水量 (m³/h)</div><div class="s">DESIGN 833.3</div></div>'
+            f'<div class="kpi-box"><div class="v">{_j(Q_avg, 1)}</div><div class="l">处理水量 (m³/h)</div><div class="s">DESIGN 833.3</div></div>'
             f'<div class="kpi-box"><div class="v">{_compliance:.0f}%</div><div class="l">综合达标率</div><div class="s">近24h</div></div>'
-            f'<div class="kpi-box"><div class="v">{_cod_rem:.0f}%</div><div class="l">COD 去除率</div></div>'
-            f'<div class="kpi-box"><div class="v">{_tn_rem:.0f}%</div><div class="l">TN 去除率</div></div>'
-            f'<div class="kpi-box"><div class="v">{_nh3_rem:.0f}%</div><div class="l">NH₃-N 去除率</div></div>'
+            f'<div class="kpi-box"><div class="v">{_j(_cod_rem, 1)}%</div><div class="l">COD 去除率</div></div>'
+            f'<div class="kpi-box"><div class="v">{_j(_tn_rem, 1)}%</div><div class="l">TN 去除率</div></div>'
+            f'<div class="kpi-box"><div class="v">{_j(_nh3_rem, 1)}%</div><div class="l">NH₃-N 去除率</div></div>'
             f'<div class="kpi-box"><div class="v">{_kwh_m3:.3f}</div><div class="l">吨水电耗 (kWh/m³)</div></div>'
             f'<div class="kpi-box"><div class="v">{_kg_m3:.3f}</div><div class="l">吨水药耗 (kg/m³)</div></div>'
             f'<div class="kpi-box"><div class="v">{latest.get("UF出水浊度(NTU)", 0):.2f}</div><div class="l">UF 出水浊度 (NTU)</div></div>'
@@ -3604,8 +3713,12 @@ if st is not None:
                 "🔮 我可以基于历史数据预测未来出水水质趋势。"
             ]
             _greeting = random.choice(_greetings)
-            with open(mascot_path, "rb") as _f:
-                _mascot_b64 = base64.b64encode(_f.read()).decode()
+            # 小鹏图片只在会话首次读取并 base64 编码一次，之后复用；
+            # 否则每次切到 AI 助手页都重读 51KB 图片并回传约 69KB 内联串（线上每次都走网络，明显变慢）。
+            if "mascot_b64_cache" not in st.session_state:
+                with open(mascot_path, "rb") as _f:
+                    st.session_state["mascot_b64_cache"] = base64.b64encode(_f.read()).decode()
+            _mascot_b64 = st.session_state["mascot_b64_cache"]
             st.markdown(f"""
             <style>
             .mascot-d {{
