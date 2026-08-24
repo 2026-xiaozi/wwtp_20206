@@ -544,9 +544,15 @@ def ai_assistant_stream(user_q, ctx, kb_dir=None):
                 if delta:
                     yield delta
             return
-    except Exception:
-        # 联网/鉴权失败：静默降级到规则引擎（保证演示永不中断）
-        pass
+    except Exception as e:
+        # 大模型调用失败时，把真实异常暴露给 UI（便于排查：网络/路径/鉴权），
+        # 然后再降级到规则引擎——保证演示永不断流。
+        err_type = type(e).__name__
+        err_msg = str(e)[:240].replace("`", "'")
+        yield (f"\n\n> ⚠️ **大模型调用失败，已自动降级到规则引擎。**\n>"
+               f" 错误类型：`{err_type}`\n>"
+               f" 错误信息：`{err_msg}`\n"
+               f"> 💡 常见原因：①网络/代理阻断 ②base_url 路径错（GLM 需 `…/api/paas/v4/`） ③Key 失效或欠费\n\n---\n\n")
     yield _rule_reply(user_q, ctx)
 
 
@@ -714,6 +720,230 @@ def _build_sample_df(hours=24*60, seed=20260808):
         "电耗(kWh/h)": np.round(energy, 1),
         "药耗(kg/h)": np.round(chem, 1),
     })
+
+
+def simulate_plant(n_steps=24*60, dt=1.0, params=None, load_profile=None,
+                   control=None, seed=20260808):
+    """五段 Bardenpho 虚拟水厂机理仿真引擎（Phase 1 数据源，双驱动之「机理」翼）。
+
+    用简化动力学（Monod 型硝化/反硝化、DO-曝气-能耗耦合、膜污染、药耗成本）
+    生成物理自洽、强耦合的「虚拟传感器」时序数据——进水氨氮升高会自动传导为
+    曝气量↑、风机功率↑(三次方)、能耗↑、出水 NH3 波动。数据遵循物理因果而非
+    随机噪声，为后续 AI 预测/优化/诊断/协同提供可信数据源。
+
+    数据契约（DataFrame 列）：
+      [兼容旧版] 时间 / 进水流量 / 进水COD/NH3-N/TN/TP / 出水COD/NH3-N/TN/TP /
+                 UF出水COD / UF出水浊度 / 跨膜压差 / 电耗 / 药耗
+      [机理扩展] DO_好氧池 / DO_缺氧1 / DO_缺氧2 / MLSS / 水温 / 曝气量 /
+                 风机功率 / 泵功率 / 内回流比 / 污泥回流比 / 碳源投加 /
+                 除磷剂投加 / 运行成本 / 吨水电耗 / 达标 / 超标项 / 反洗事件
+    控制量（control 字典）为 Phase 3「AI 优化→一键执行」预留的决策变量：
+      DO_setpoint / R_internal / R_sludge / carbon_active / chem_p_active。
+
+    纯函数：不依赖 Streamlit，可单测。数值稳定：物理量经 clip 约束，无 NaN/Inf。
+    """
+    rng = np.random.default_rng(seed)
+
+    # ---- 默认工艺参数（可覆盖） ----
+    p = dict(
+        Q_design=20000.0 / 24.0,   # m³/h 设计小时流量（2 万 m³/d）
+        MLSS=4.0,                  # g/L 好氧池污泥浓度
+        V_ae=3000.0,               # m³ 好氧池有效容积
+        DO_sat=9.0,                # mg/L 饱和溶解氧
+        T_water=18.0,              # ℃ 水温
+        aer_rated_kw=220.0,        # kW 曝气风机额定功率
+        pump_rated_kw=45.0,        # kW 内/外回流泵额定功率
+        elec_price=0.7,            # 元/kWh
+        carbon_price=2.5,          # 元/kg 碳源（乙酸钠）
+        chem_p_price=3.0,          # 元/kg 除磷剂（PAC）
+        tmp_init=14.0,             # kPa 反洗后 TMP 基线
+        tmp_wash=26.0,             # kPa 反洗触发阈值
+        k_foul=0.055,              # kPa/h 膜污染速率系数
+    )
+    if params:
+        p.update(params)
+    Q_d = float(p["Q_design"])
+
+    # ---- 控制变量（默认固定控制；Phase 3 由 AI 优化模型接管） ----
+    c = dict(DO_setpoint=2.0, R_internal=3.0, R_sludge=1.0,
+             carbon_active=True, chem_p_active=True)
+    if control:
+        c.update(control)
+
+    # ---- 时间轴 ----
+    if dt == 1.0:
+        freq = "h"
+    elif dt < 1.0:
+        freq = f"{int(round(dt * 60))}min"
+    else:
+        freq = f"{int(dt)}h"
+    start = pd.Timestamp("2026-06-01 00:00")
+    t = pd.date_range(start, periods=n_steps, freq=freq)
+    hour = t.hour.to_numpy(dtype=float)
+    dow = t.dayofweek.to_numpy(dtype=float)
+    day_idx = np.arange(n_steps)
+
+    # ---- 负荷发生器：日双峰 + 周因子 + 30 天慢趋势 + 冲击事件 ----
+    diurnal = 0.5 * np.sin(2 * np.pi * (hour - 4) / 24) + 0.5 * np.sin(2 * np.pi * (hour - 16) / 24)
+    diurnal = (diurnal - diurnal.min()) / max(diurnal.max() - diurnal.min(), 1e-9)
+    week_f = np.where(dow >= 5, 0.92, 1.0)
+    trend = 1.0 + 0.06 * np.sin(2 * np.pi * day_idx / (24 * 30.0))
+
+    impact = np.ones(n_steps)
+    if load_profile is not None:
+        impact = np.asarray(load_profile, dtype=float) * impact
+    else:
+        n_evt = max(int(n_steps * 0.012), 1) if n_steps > 80 else 0
+        for _ in range(n_evt):
+            i0 = int(rng.integers(0, max(n_steps - 20, 1)))
+            dur = int(rng.integers(8, 17))
+            mult = float(rng.uniform(1.25, 1.6))
+            impact[i0:i0 + dur] = np.maximum(impact[i0:i0 + dur], mult)
+    impact = impact * (1 + rng.normal(0, 0.04, n_steps))
+
+    shape = (0.55 + 0.55 * diurnal) * week_f * trend * impact
+    shape /= shape.mean()
+    Q = np.clip(Q_d * shape, Q_d * 0.5, Q_d * 1.6)
+
+    def _inload(base, cv, q_dep):
+        v = base * (1 + q_dep * (shape / shape.mean() - 1)) * (1 + rng.normal(0, cv, n_steps))
+        return np.clip(v, base * 0.4, base * 2.2)
+
+    cod_in = _inload(350.0, 0.10, 0.25)
+    nh3_in = _inload(35.0, 0.12, 0.30)
+    org_n = _inload(18.0, 0.10, 0.25)
+    tn_in = np.clip(nh3_in + org_n, 30.0, 90.0)
+    tp_in = _inload(5.0, 0.12, 0.28)
+    T = float(p["T_water"])
+    fT = 1.0 + 0.02 * (T - 18.0)   # 温度对硝化速率小调制
+
+    # ---- 逐时推进（简化集中参数动力学，保持物理因果） ----
+    n = n_steps
+    K_DO = 1.0
+    do_ae = np.full(n, float(c["DO_setpoint"])) * (1 + rng.normal(0, 0.02, n))
+    do_ax1 = np.full(n, 0.2) * (1 + rng.normal(0, 0.05, n))
+    do_ax2 = np.full(n, 0.3) * (1 + rng.normal(0, 0.05, n))
+    mlss = np.full(n, float(p["MLSS"])) * (1 + rng.normal(0, 0.03, n))
+    cod_out = np.zeros(n); nh3_out = np.zeros(n); tn_out = np.zeros(n); tp_out = np.zeros(n)
+    uf_cod = np.zeros(n); uf_turb = np.zeros(n)
+    aer_flow = np.zeros(n); aer_power = np.zeros(n); pump_power = np.zeros(n)
+    carbon_dose = np.zeros(n); chem_p = np.zeros(n)
+    tmp = np.zeros(n); wash = np.zeros(n, dtype=int)
+    energy = np.zeros(n); op_cost = np.zeros(n)
+    std_ok = np.ones(n, dtype=int); std_fail = [""] * n
+    tmp_v = float(p["tmp_init"])
+
+    for i in range(n):
+        d = float(do_ae[i])
+        # 硝化：DO 指数调制（DO 不足 → 出水 NH3 恶化，物理正确）
+        eta_nit = 1.0 - 0.015 * np.exp(3.2 * max(1.0 - d / 2.0, 0.0)) * (1.0 / fT)
+        eta_nit = float(np.clip(eta_nit, 0.55, 0.992))
+        nh3_out[i] = float(np.clip(nh3_in[i] * (1.0 - eta_nit) + 0.05, 0.02, 30.0))
+
+        # COD 去除：基准 + DO/MLSS 小调制（常态去除率 ≥93%，冲击负荷时偶发超标）
+        dof = d / (K_DO + d)
+        eta_cod = float(np.clip(0.965 * (0.92 + 0.08 * dof) * (mlss[i] / 4.0) ** 0.1, 0.90, 0.985))
+        cod_out[i] = float(np.clip(cod_in[i] * (1.0 - eta_cod) + 2.0, 1.0, 60.0))
+
+        # 反硝化：C/N 充足度 + 缺氧池 DO；碳源不足时投加（药耗↑、TN↓）
+        cn = (cod_in[i] * 0.4) / max(tn_in[i], 1e-9)
+        eta_denit = 0.78 + 0.05 * min(cn / 4.0, 1.2) - 0.12 * do_ax1[i] / (0.2 + do_ax1[i])
+        if c["carbon_active"] and cn < 4.0:
+            eta_denit += 0.04
+            carbon_dose[i] = max((4.0 - cn) * tn_in[i] * Q[i] / 1000.0 * 0.06, 0.0)
+        eta_denit = float(np.clip(eta_denit, 0.55, 0.86))
+        tn_out[i] = float(np.clip(tn_in[i] * (1.0 - eta_denit) + 0.5, 0.5, 40.0))
+
+        # 除磷：生物去除 + 化学投加（按需投加至目标出水 TP，稳定达标）
+        tp_bio = float(np.clip(tp_in[i] * 0.30 + 0.02, 0.02, 2.0))
+        tp_target = 0.15
+        if c["chem_p_active"] and tp_bio > tp_target:
+            need_rem = tp_bio - tp_target
+            chem_p[i] = need_rem * Q[i] / 1000.0 * 1.8   # kg/h（PAC，1.8 折算系数）
+            tp_out[i] = float(np.clip(tp_target + rng.normal(0, 0.01), 0.02, 2.0))
+        else:
+            tp_out[i] = tp_bio
+
+        # DO 平衡 → 曝气量 → 风机功率（风机相似定律：功率 ∝ 流量³）
+        our_nit = 4.57 * (nh3_in[i] - nh3_out[i]) * Q[i] / p["V_ae"]
+        our_cod = 0.55 * (cod_in[i] - cod_out[i]) * Q[i] / p["V_ae"]
+        our = max(our_nit + our_cod + 0.3, 0.3)
+        kla_req = (our + d * 0.02) / max(p["DO_sat"] - d, 0.1)
+        aer_flow[i] = float(kla_req * p["V_ae"] / 16.0)   # /16 标定：典型 1500–3800 m³/h，避免功率恒饱和
+        aer_power[i] = float(p["aer_rated_kw"] * (min(aer_flow[i] / 4000.0, 1.0)) ** 3)
+
+        # 回流泵功率（∝ 流量 × 回流强度）
+        pump_power[i] = float(p["pump_rated_kw"] * (Q[i] / Q_d) *
+                              (0.7 + 0.15 * c["R_internal"] + 0.08 * c["R_sludge"]))
+
+        # 能耗与运行成本
+        energy[i] = aer_power[i] + pump_power[i]
+        op_cost[i] = (energy[i] * dt * p["elec_price"]
+                      + carbon_dose[i] * dt * p["carbon_price"]
+                      + chem_p[i] * dt * p["chem_p_price"])
+
+        # UF 跨膜压差：污染上升 — 反洗回落
+        flux = Q[i] / Q_d
+        tmp_v += p["k_foul"] * flux * dt
+        if tmp_v >= p["tmp_wash"]:
+            tmp_v = float(p["tmp_init"]) * (1.0 + rng.normal(0, 0.01))
+            wash[i] = 1
+        tmp[i] = tmp_v
+        uf_cod[i] = cod_out[i] * (1.0 - float(rng.uniform(0.02, 0.05)))
+        uf_turb[i] = float(rng.uniform(0.03, 0.09))
+
+        # 达标（准四类：COD≤30、NH3-N≤1.5、TN≤15、TP≤0.3）
+        fails = []
+        if cod_out[i] > 30: fails.append("COD")
+        if nh3_out[i] > 1.5: fails.append("NH3-N")
+        if tn_out[i] > 15: fails.append("TN")
+        if tp_out[i] > 0.3: fails.append("TP")
+        std_ok[i] = 0 if fails else 1
+        std_fail[i] = "、".join(fails)
+
+    return pd.DataFrame({
+        "时间": t.strftime("%Y-%m-%d %H:%M"),
+        "进水流量(m3/h)": np.round(Q, 1),
+        "进水COD(mg/L)": np.round(cod_in, 1),
+        "进水NH3-N(mg/L)": np.round(nh3_in, 1),
+        "进水TN(mg/L)": np.round(tn_in, 1),
+        "进水TP(mg/L)": np.round(tp_in, 2),
+        "出水COD(mg/L)": np.round(cod_out, 1),
+        "出水NH3-N(mg/L)": np.round(nh3_out, 2),
+        "出水TN(mg/L)": np.round(tn_out, 2),
+        "出水TP(mg/L)": np.round(tp_out, 3),
+        "UF出水COD(mg/L)": np.round(uf_cod, 1),
+        "UF出水浊度(NTU)": np.round(uf_turb, 2),
+        "跨膜压差(kPa)": np.round(tmp, 1),
+        "电耗(kWh/h)": np.round(energy, 1),
+        "药耗(kg/h)": np.round(carbon_dose + chem_p, 1),
+        "DO_好氧池(mg/L)": np.round(do_ae, 2),
+        "DO_缺氧1(mg/L)": np.round(do_ax1, 2),
+        "DO_缺氧2(mg/L)": np.round(do_ax2, 2),
+        "MLSS(g/L)": np.round(mlss, 2),
+        "水温(℃)": np.round(np.full(n, T), 1),
+        "曝气量(m3/h)": np.round(aer_flow, 0),
+        "风机功率(kW)": np.round(aer_power, 1),
+        "泵功率(kW)": np.round(pump_power, 1),
+        "内回流比": np.full(n, c["R_internal"]),
+        "污泥回流比": np.full(n, c["R_sludge"]),
+        "碳源投加(kg/h)": np.round(carbon_dose, 2),
+        "除磷剂投加(kg/h)": np.round(chem_p, 2),
+        "运行成本(元/h)": np.round(op_cost, 1),
+        "吨水电耗(kWh/m3)": np.round(energy / Q, 3),
+        "达标": std_ok,
+        "超标项": std_fail,
+        "反洗事件": wash,
+    })
+
+
+def gen_plant_csv(path=None, n_steps=24 * 60, seed=20260808, **kw):
+    """用机理引擎生成历史运行 CSV 并落盘（Phase 2 起作为 AI 页数据源）。
+    返回文件路径；path 缺省时输出到脚本目录 plant_sim_history.csv。"""
+    df = simulate_plant(n_steps=n_steps, seed=seed, **kw)
+    path = path or os.path.join(SCRIPT_DIR, "plant_sim_history.csv")
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    return path
 
 
 def export_pdf_report(bp, bio, cost):
@@ -1020,7 +1250,7 @@ if st is not None:
     .stApp > header{ display:none !important; }
     /* 压缩主内容区顶部边距 */
     .main .block-container,
-    .block-container{ padding-top:0rem !important; padding-bottom:3rem; }
+    .block-container{ max-width:100% !important; padding-left:1.5rem !important; padding-right:1.5rem !important; padding-top:0rem !important; padding-bottom:3rem; }
     .appview-container,
     [data-testid="stAppViewContainer"]{ padding-top:0rem !important; }
     .appview-container > .main,
@@ -2273,7 +2503,7 @@ if st is not None:
             aer_now = sim['aer'][-1]
             turb_now = sim['turb'][-1]
             delta = tmp_now - sim['tmp'][-2] if len(sim['tmp']) > 1 else None
-            # 把派生指标写进 session_state，供 fragment 外的「⑤ AI 预测」区块读取（避免 NameError）
+            # 把派生指标写进 session_state，供 fragment 外的「④ AI 预测」区块读取（避免 NameError）
             st.session_state['uf_aer'] = aer_now
             st.session_state['uf_turb'] = turb_now
             st.session_state['uf_tmp'] = tmp_now
@@ -2300,39 +2530,14 @@ if st is not None:
                 st.success(f"✅ 工况正常：TMP 距 CEB 阈值尚有 {ceb_thr - tmp_now:.1f} kPa 余量")
 
 
-            # ---------- ④ 运行趋势 ----------
-            st.markdown("---")
-            st.subheader("④ 运行趋势")
-            df = pd.DataFrame({'帧': sim['t'], 'TMP(kPa)': sim['tmp'], '通量(LMH)': sim['flux'],
-                               '曝气(m³/m²·h)': sim['aer'], '浊度(NTU)': sim['turb']})
-            if go is not None:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df['帧'], y=df['TMP(kPa)'], name='TMP', line=dict(color='#0e7490', width=2)))
-                fig.add_hline(y=ceb_thr, line=dict(color='#d97706', dash='dash'),
-                              annotation_text='CEB阈值', annotation_position='top left')
-                fig.add_hline(y=tmp_alarm, line=dict(color='#dc2626', dash='dash'),
-                              annotation_text='报警限值', annotation_position='top left')
-                fig.update_layout(height=320, margin=dict(t=20, b=40, l=40, r=20), legend=dict(orientation='h'))
-                st.plotly_chart(fig, use_container_width=True)
-                fig2 = go.Figure()
-                fig2.add_trace(go.Scatter(x=df['帧'], y=df['通量(LMH)'], name='通量', yaxis='y1'))
-                fig2.add_trace(go.Scatter(x=df['帧'], y=df['曝气(m³/m²·h)'], name='曝气', yaxis='y1'))
-                fig2.add_trace(go.Scatter(x=df['帧'], y=df['浊度(NTU)'], name='浊度', yaxis='y2'))
-                fig2.update_layout(height=300, margin=dict(t=20, b=40, l=40, r=40),
-                                   yaxis=dict(title='通量/曝气'),
-                                   yaxis2=dict(title='浊度(NTU)', overlaying='y', side='right', range=[0, 0.1]))
-                st.plotly_chart(fig2, use_container_width=True)
-            else:
-                st.line_chart(df.set_index('帧')[['TMP(kPa)', '通量(LMH)', '曝气(m³/m²·h)', '浊度(NTU)']])
-    
-            # ---------- ⑤ AI 预测与运维指导 ----------
+            # ---------- ④ AI 预测与运维指导 ----------
             # 从 session_state 读取 fragment 内实时计算的派生指标（避免 NameError）
             aer_now = st.session_state.get('uf_aer', 0.0)
             turb_now = st.session_state.get('uf_turb', 0.0)
             tmp_now = st.session_state.get('uf_tmp', 0.0)
             flux_now = st.session_state.get('uf_flux', 0.0)
             st.markdown("---")
-            st.subheader("⑤ AI 预测与运维指导")
+            st.subheader("④ AI 预测与运维指导")
             n = len(sim['tmp'])
             # 稳定斜率：取近 30 帧帧间增量的中位数，抑制单帧噪声导致的预测跳动
             if n >= 10:
@@ -2341,7 +2546,7 @@ if st is not None:
                 slope = float(np.median(_inc)) if len(_inc) else 0.0
             else:
                 slope = 0.0
-            # 把 slope 写进 session_state，供 fragment 外的「⑤ 大模型诊断」按钮读取（避免 NameError / 作用域问题）
+            # 把 slope 写进 session_state，供 fragment 外的「④ 大模型诊断」按钮读取（避免 NameError / 作用域问题）
             st.session_state['uf_slope'] = slope
             pred_lines = []
             if n < 10:
@@ -2381,7 +2586,7 @@ if st is not None:
 
         _uf_live()
 
-        # ---------- ⑤ 高阶 AI：大模型运维诊断报告（置于 fragment 之外） ----------
+        # ---------- ④ 高阶 AI：大模型运维诊断报告（置于 fragment 之外） ----------
         # 说明：若把"调用大模型"按钮写在上面的 _uf_live() fragment 内，会被 run_every=2 的
         # 定时重跑每 2 秒清空/重置，导致"点击后回答一闪而过、按钮状态丢失"。故将其移出 fragment，
         # 作为本页静态区块；实时数据从 session_state（由 fragment 每 2s 写入）读取，保证回答稳定留存。
@@ -2475,125 +2680,6 @@ if st is not None:
                     st.metric("月电费", f"{res['cost_month']:,.2f} 元")
                     st.metric("吨水电耗", f"{res['unit_power']:.3f} kWh/m³")
                     st.metric("吨水电费", f"{res['unit_cost']:.3f} 元/m³")
-
-                st.info(f"💡 节能提示：曝气系统占总电耗 {res['e_aeration']/res['e_total_day']*100:.1f}%，采用DO变频曝气可节电15%~25%")
-
-            # ===== AI 曝气变频节能实时仿真（演示）=====
-            st.divider()
-            st.subheader("🤖 AI 曝气变频节能实时仿真")
-            st.caption("模拟 AI 根据进水氨氮变化动态调节曝气风机变频器频率，在保证出水达标前提下降低电耗。"
-                       "本模块为机理仿真：风机功率按相似定律 P∝n³ 计算，优化逻辑可对接真实 DCS/PLC。")
-
-            sim_c1, sim_c2 = st.columns(2)
-            with sim_c1:
-                sim_rated_kw = num_input("风机额定功率 (kW)", value=220, key="sim_rated_kw")
-            with sim_c2:
-                # v17: 默认切到 AI 优化，避免"固定 50Hz（传统）"模式把 DO/Hz/功率锁定，看起来像"不动"
-                st.radio("控制模式", ["🤖 AI 优化", "固定 50Hz（传统）"],
-                         key="sim_mode", index=0, horizontal=True)
-
-            # 仿真状态
-            if 'aero_sim' not in st.session_state:
-                st.session_state.aero_sim = {'t': [], 'nh3': [], 'do': [], 'tn': [],
-                                             'freq': [], 'power': [], 'base_power': [], 'save': []}
-                st.session_state.aero_t = 0
-            sim = st.session_state.aero_sim
-
-            def aero_step():
-                t = st.session_state.aero_t + 1
-                # 进水氨氮：日周期波动 + 噪声（典型市政污水进水 NH3-N 约 10~55 mg/L）
-                nh3_in = 30.0 + 13.0 * (np.sin(t / 2.5) * 0.5 + 0.5) + float(np.random.normal(0, 2.0))
-                nh3_in = float(np.clip(nh3_in, 10.0, 55.0))
-                # v17: sim_mode / sim_rated_kw 现在走 session_state（radio/num_input 自动写入）；
-                # 不能继续用 fragment 外的局部变量（fragment 内可能读到旧值）
-                _mode = st.session_state.get("sim_mode", "🤖 AI 优化")
-                _rated_kw = st.session_state.get("sim_rated_kw", 220)
-                if _mode == "🤖 AI 优化":
-                    target_do = float(np.clip(1.3 + 0.024 * nh3_in, 1.3, 2.5))
-                    freq = float(np.clip(target_do * 20, 30, 50))      # DO 1.5→30Hz, 2.5→50Hz
-                else:
-                    target_do = 2.0
-                    freq = 50.0
-                power = (freq / 50) ** 3 * _rated_kw
-                base_power = (50 / 50) ** 3 * _rated_kw
-                do_norm = (target_do - 1.5)
-                tn = float(np.clip(13.0 - 5.0 * do_norm + float(np.random.normal(0, 0.35)), 5.0, 25.0))
-                sim['t'].append(t); sim['nh3'].append(nh3_in); sim['do'].append(target_do)
-                sim['tn'].append(tn); sim['freq'].append(freq)
-                sim['power'].append(power); sim['base_power'].append(base_power)
-                sim['save'].append(max(0.0, base_power - power))
-                st.session_state.aero_t = t
-
-            # ---------- 控制 + 指标 + 趋势 自包含 fragment（每 3s 自动重跑，与 UF 同套修复） ----------
-            # 把"开始/重置/采集下一帧 + 自动滚动 checkbox + 4 个指标 metric + 达标提示 + 功率对比图"
-            # 全部塞进同一个 @st.fragment(run_every=3)。原 v12 写法只在 fragment 内推进数据、
-            # metric 与图表在 fragment 外，run_every 不触发整页 rerun → 数值看似"不刷新"。
-            @st.fragment(run_every=3)
-            def _aero_live():
-                if page != "💰 成本经济核算":
-                    return
-                # 数据推进（首次或勾选自动滚动时）
-                if not sim['t']:
-                    aero_step()
-                elif st.session_state.get("aero_auto", True):
-                    aero_step()
-
-                # 控制按钮 + checkbox
-                bb1, bb2, bb3 = st.columns([1, 1, 1])
-                with bb1:
-                    if st.button("▶ 开始 / 重置仿真", type="primary", key="aero_start"):
-                        st.session_state.aero_sim = {'t': [], 'nh3': [], 'do': [], 'tn': [],
-                                                     'freq': [], 'power': [], 'base_power': [], 'save': []}
-                        st.session_state.aero_t = 0
-                        st.session_state.sim_mode = "🤖 AI 优化"
-                        st.rerun(scope="fragment")
-                with bb2:
-                    if st.button("⏭ 采集下一帧", key="aero_next"):
-                        aero_step()
-                        st.rerun(scope="fragment")
-                with bb3:
-                    st.checkbox("自动滚动（3 s）", value=True, key="aero_auto")
-
-                # 累计节电（醒目）
-                total_save = sum(sim['save'])
-                st.success(f"💰 本次模拟累计节省电耗：**{total_save:.1f} kWh**（AI 变频较传统恒速）")
-
-                # 4 个实时指标
-                am1, am2, am3, am4 = st.columns(4)
-                with am1:
-                    st.metric("进水氨氮", f"{sim['nh3'][-1]:.1f} mg/L")
-                with am2:
-                    st.metric("设定 DO", f"{sim['do'][-1]:.2f} mg/L")
-                with am3:
-                    st.metric("风机频率", f"{sim['freq'][-1]:.1f} Hz")
-                with am4:
-                    st.metric("实时功率", f"{sim['power'][-1]:.1f} kW")
-
-                # 出水达标判定
-                tn_now = sim['tn'][-1]
-                if tn_now <= 15:
-                    st.success(f"✅ 出水 TN {tn_now:.1f} mg/L 达标（≤15 mg/L）")
-                else:
-                    st.warning(f"⚠️ 出水 TN {tn_now:.1f} mg/L 接近超标，建议提高 DO")
-
-                # 趋势图（也搬进 fragment，否则也不刷新）
-                df_sim = pd.DataFrame({
-                    '帧': sim['t'], '进水氨氮': sim['nh3'], 'DO': sim['do'], '出水TN': sim['tn'],
-                    '风机频率': sim['freq'], 'AI功率': sim['power'], '传统功率': sim['base_power']
-                })
-                if go is not None and len(df_sim) > 1:
-                    st.markdown("##### 功率对比（kW）")
-                    fig_p = go.Figure()
-                    fig_p.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['AI功率'], name='AI 变频功率'))
-                    fig_p.add_trace(go.Scatter(x=df_sim['帧'], y=df_sim['传统功率'], name='传统恒速功率'))
-                    fig_p.update_layout(height=280, margin=dict(t=10, b=60, l=50, r=20),
-                                        yaxis=dict(title='功率 (kW)'),
-                                        legend=dict(orientation='h', yanchor='top', y=-0.18))
-                    st.plotly_chart(fig_p, use_container_width=True)
-                else:
-                    st.line_chart(df_sim.set_index('帧')[['AI功率', '传统功率']])
-
-            _aero_live()
 
         # 药剂成本
         with tab2:
@@ -2940,126 +3026,140 @@ if st is not None:
     elif page == "🔮 AI 预测预警":
         st.header("🔮 出水水质AI预测预警")
         st.caption("多模型集成预测：Holt-Winters + 谐波回归 + 季节朴素，经历史回测逆误差自动加权选优；"
-                   "纯算法无需联网。默认载入内置合成测试数据。")
+                   "数据源自内置「虚拟水厂」机理仿真引擎（五段 Bardenpho 动力学生成、物理自洽），"
+                   "可预测出水水质、膜系统运行及进水负荷等关键参数。")
 
-        if not os.path.exists(SAMPLE_CSV):
-            st.info("⚙️ 未找到本地示例数据，正在即时生成合成演示数据…")
-            df = _build_sample_df()
-            saved = False
+        # ---- 数据源：优先「虚拟水厂」机理仿真引擎，失败回退合成演示数据 ----
+        PLANT_CSV = os.path.join(SCRIPT_DIR, "plant_sim_history.csv")
+        df = None
+        if os.path.exists(PLANT_CSV):
             try:
-                df.to_csv(SAMPLE_CSV, index=False, encoding="utf-8-sig")
-                saved = True
+                df = pd.read_csv(PLANT_CSV)
+                df["时间"] = pd.to_datetime(df["时间"])
+                df = df.set_index("时间").sort_index()
             except Exception:
-                pass
-            if saved:
-                st.rerun()
-        else:
-            df = pd.read_csv(SAMPLE_CSV)
+                df = None
+        if df is None:
+            try:
+                st.info("⚙️ 正在生成「虚拟水厂」机理仿真数据（五段 Bardenpho 动力学，约数秒）…")
+                df = simulate_plant(n_steps=24 * 60, seed=20260808)
+                try:
+                    df.to_csv(PLANT_CSV, index=False, encoding="utf-8-sig")
+                except Exception:
+                    pass
+            except Exception:
+                st.warning("机理仿真引擎不可用，已回退内置合成演示数据。")
+                df = _build_sample_df()
             df["时间"] = pd.to_datetime(df["时间"])
             df = df.set_index("时间").sort_index()
-            var_options = {
-                "出水COD(mg/L)": 30, "出水NH3-N(mg/L)": 1.5, "出水TN(mg/L)": 15,
-                "出水TP(mg/L)": 0.3, "UF出水COD(mg/L)": 30, "UF出水浊度(NTU)": None,
-                "跨膜压差(kPa)": None, "进水流量(m3/h)": None, "进水COD(mg/L)": None,
-                "进水TN(mg/L)": None, "进水TP(mg/L)": None,
+
+        # 可预测指标：水质/膜运行/进水负荷（能耗成本类机理运行参数已精简移除）
+        var_options = {
+            "出水COD(mg/L)": 30, "出水NH3-N(mg/L)": 1.5, "出水TN(mg/L)": 15,
+            "出水TP(mg/L)": 0.3, "UF出水浊度(NTU)": None,
+            "跨膜压差(kPa)": None, "进水流量(m3/h)": None, "进水COD(mg/L)": None,
+            "进水TN(mg/L)": None, "进水TP(mg/L)": None, "DO_好氧池(mg/L)": None,
+        }
+        # 动态过滤：兜底合成数据可能缺少机理字段，只保留实际存在的列（避免 KeyError）
+        var_options = {k: v for k, v in var_options.items() if k in df.columns}
+
+        season = 24
+        # 顶部两个选择器分两列；按钮、指标卡、图表、回测表统一放到 col 外，铺满主区
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            var = st.selectbox("预测指标", list(var_options.keys()))
+        with col2:
+            horizon = st.selectbox("预测步长（小时）", [24, 48, 168], index=0)
+        if st.button("🚀 运行预测", type="primary", key="predict_btn"):
+            with st.spinner("正在多模型回测与集成预测…"):
+                series = df[var].dropna().to_numpy(dtype=float)
+                res = smart_forecast(series, season=int(season), h=int(horizon))
+            st.session_state.predict_result = {
+                "schema": RESULT_SCHEMA, "var": var, "horizon": int(horizon),
+                "res": res, "std": var_options[var], "season": int(season),
             }
+        if st.session_state.get("predict_result", {}).get("schema") == RESULT_SCHEMA:
+            pr = st.session_state.predict_result
+            res = pr["res"]; var = pr["var"]; std = pr["std"]
+            s = res["series"]; fc = res["forecast"]; lo = res["lower"]; up = res["upper"]
+            idx_hist = df.index
+            last = idx_hist[-1]
+            idx_fc = pd.date_range(last + pd.Timedelta(hours=1), periods=len(fc), freq="h")
 
-            season = 24
-            col1, col2 = st.columns(2)
-            with col1:
-                var = st.selectbox("预测指标", list(var_options.keys()))
-            with col2:
-                horizon = st.selectbox("预测步长（小时）", [24, 48, 168], index=0)
-            if st.button("运行预测", type="primary", key="predict_btn"):
-                with st.spinner("正在多模型回测与集成预测…"):
-                    series = df[var].dropna().to_numpy(dtype=float)
-                    res = smart_forecast(series, season=int(season), h=int(horizon))
-                st.session_state.predict_result = {
-                    "schema": RESULT_SCHEMA, "var": var, "horizon": int(horizon),
-                    "res": res, "std": var_options[var], "season": int(season),
-                }
-            if st.session_state.get("predict_result", {}).get("schema") == RESULT_SCHEMA:
-                pr = st.session_state.predict_result
-                res = pr["res"]; var = pr["var"]; std = pr["std"]
-                s = res["series"]; fc = res["forecast"]; lo = res["lower"]; up = res["upper"]
-                idx_hist = df.index
-                last = idx_hist[-1]
-                idx_fc = pd.date_range(last + pd.Timedelta(hours=1), periods=len(fc), freq="h")
+            # ---- 指标卡（铺满主区宽度） ----
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("预测均值", f"{fc.mean():.2f}")
+            c2.metric("预测峰值", f"{fc.max():.2f}")
+            n_warn = int((up > std).sum()) if std is not None else 0
+            c3.metric("超标风险时点", f"{n_warn}/{len(fc)}" if std is not None else "—")
+            c4.metric("历史异常点", f"{len(res['anomalies'])}")
 
-                # ---- 指标卡 ----
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("预测均值", f"{fc.mean():.2f}")
-                c2.metric("预测峰值", f"{fc.max():.2f}")
-                n_warn = int((up > std).sum()) if std is not None else 0
-                c3.metric("超标风险时点", f"{n_warn}/{len(fc)}" if std is not None else "—")
-                c4.metric("历史异常点", f"{len(res['anomalies'])}")
+            # ---- 主预测图（铺满主区宽度） ----
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=idx_hist[-7 * 24:], y=s[-7 * 24:],
+                                     name="历史(近7天)", line=dict(color="#0E7490")))
+            fig.add_trace(go.Scatter(x=idx_fc, y=up, line=dict(width=0), showlegend=False))
+            fig.add_trace(go.Scatter(x=idx_fc, y=lo, line=dict(width=0), fill="tonexty",
+                                     fillcolor="rgba(20,184,166,0.22)", name="95%置信区间"))
+            fig.add_trace(go.Scatter(x=idx_fc, y=fc, name="AI集成预测",
+                                     line=dict(color="#F59E0B", dash="dot", width=2)))
+            if std is not None:
+                fig.add_hline(y=std, line=dict(color="#DC2626", dash="dash"))
+                fig.add_annotation(
+                    x=0.99, y=std, xref="paper", yref="y",
+                    text=f"标准限值 {std}",
+                    showarrow=False,
+                    font=dict(color="#DC2626", size=13),
+                    xanchor="right", yanchor="bottom",
+                    yshift=3,
+                    bgcolor="white"
+                )
+            fig.update_layout(title=dict(text=f"{var} 未来 {pr['horizon']} 小时 AI 预测", x=0.02, xanchor="left"),
+                              xaxis_title="时间", yaxis_title=var, template="plotly_white",
+                              legend=dict(orientation="h", x=1.0, y=1.02,
+                                           xanchor="right", yanchor="bottom",
+                                           font=dict(color="black")),
+                              margin=dict(t=60, b=80))
+            fig.update_xaxes(tickformat="%m月%d日", dtick=86400000.0, tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
 
-                # ---- 主预测图 ----
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=idx_hist[-7 * 24:], y=s[-7 * 24:],
-                                         name="历史(近7天)", line=dict(color="#0E7490")))
-                fig.add_trace(go.Scatter(x=idx_fc, y=up, line=dict(width=0), showlegend=False))
-                fig.add_trace(go.Scatter(x=idx_fc, y=lo, line=dict(width=0), fill="tonexty",
-                                         fillcolor="rgba(20,184,166,0.22)", name="95%置信区间"))
-                fig.add_trace(go.Scatter(x=idx_fc, y=fc, name="AI集成预测",
-                                         line=dict(color="#F59E0B", dash="dot", width=2)))
-                if std is not None:
-                    fig.add_hline(y=std, line=dict(color="#DC2626", dash="dash"))
-                    fig.add_annotation(
-                        x=0.99, y=std, xref="paper", yref="y",
-                        text=f"标准限值 {std}",
-                        showarrow=False,
-                        font=dict(color="#DC2626", size=13),
-                        xanchor="right", yanchor="bottom",
-                        yshift=3,
-                        bgcolor="white"
-                    )
-                fig.update_layout(title=dict(text=f"{var} 未来 {pr['horizon']} 小时 AI 预测", x=0.02, xanchor="left"),
-                                  xaxis_title="时间", yaxis_title=var, template="plotly_white",
-                                  legend=dict(orientation="h", x=1.0, y=1.02,
-                                               xanchor="right", yanchor="bottom",
-                                               font=dict(color="black")),
-                                  margin=dict(t=60, b=80))
-                fig.update_xaxes(tickformat="%m月%d日", dtick=86400000.0, tickangle=-45)
-                st.plotly_chart(fig, use_container_width=True)
-
-                # ---- 预警（概率化 + 机理联动，item 10）----
-                if std is not None:
-                    # 基于残差σ的正态近似，估算整体达标风险概率（纯 numpy，无需 scipy）
-                    z = (std - fc) / max(res["sigma"], 1e-9)
-                    risk_pct = float(np.clip(1 - _norm_cdf(z), 0, 1).mean()) * 100
-                    if n_warn > 0 or risk_pct > 5:
-                        bio = get_compute_result("bio_result")
-                        st.error(f"⚠️ 预测区间上限有 {n_warn}/{len(fc)} 个时点超过标准限值 {std} mg/L；"
-                                 f"按历史波动估计，整体达标风险概率约 **{risk_pct:.0f}%**。建议提前调控。")
-                        advice = mechanism_advice(var, bio)
-                        if advice:
-                            st.info("🔧 机理联动建议：" + advice)
-                    else:
-                        st.success(f"✅ 预测期内出水 {var} 预计均低于标准限值 {std} mg/L"
-                                   f"（达标风险概率约 {risk_pct:.0f}%）")
+            # ---- 预警（概率化 + 机理联动，item 10）----
+            if std is not None:
+                # 基于残差σ的正态近似，估算整体达标风险概率（纯 numpy，无需 scipy）
+                z = (std - fc) / max(res["sigma"], 1e-9)
+                risk_pct = float(np.clip(1 - _norm_cdf(z), 0, 1).mean()) * 100
+                if n_warn > 0 or risk_pct > 5:
+                    bio = get_compute_result("bio_result")
+                    st.error(f"⚠️ 预测区间上限有 {n_warn}/{len(fc)} 个时点超过标准限值 {std} mg/L；"
+                             f"按历史波动估计，整体达标风险概率约 **{risk_pct:.0f}%**。建议提前调控。")
+                    advice = mechanism_advice(var, bio)
+                    if advice:
+                        st.info("🔧 机理联动建议：" + advice)
                 else:
-                    st.info("该指标无强制排放标准，仅作负荷趋势预测")
-                # 进水负荷冲击的机理联动提示（跨变量，与预测指标无关）
-                surge = influent_surge_note(var, s, res["forecast"], season=int(pr["season"]))
-                if surge:
-                    st.warning("📈 " + surge)
+                    st.success(f"✅ 预测期内出水 {var} 预计均低于标准限值 {std} mg/L"
+                               f"（达标风险概率约 {risk_pct:.0f}%）")
+            else:
+                st.info("该指标无强制排放标准，仅作负荷趋势预测")
+            # 进水负荷冲击的机理联动提示（跨变量，与预测指标无关）
+            surge = influent_surge_note(var, s, res["forecast"], season=int(pr["season"]))
+            if surge:
+                st.warning("📈 " + surge)
 
-                # ---- 模型回测对比 ----
-                if res["metrics"]:
-                    st.subheader("📊 模型回测精度（留一法，尾部验证集）")
-                    mt = res["metrics"]
-                    rows = []
-                    for name in mt:
-                        rows.append({
-                            "模型": name,
-                            "集成权重": f"{res['weights'].get(name, 0) * 100:.0f}%",
-                            "RMSE": f"{mt[name]['RMSE']:.3f}",
-                            "MAE": f"{mt[name]['MAE']:.3f}",
-                            "MAPE(%)": f"{mt[name]['MAPE(%)']:.1f}",
-                        })
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                    st.caption("系统按回测 RMSE 逆误差加权自动集成三个模型：权重越高代表该模型在历史验证集上越可靠。")
+            # ---- 模型回测对比 ----
+            if res["metrics"]:
+                st.subheader("📊 模型回测精度（留一法，尾部验证集）")
+                mt = res["metrics"]
+                rows = []
+                for name in mt:
+                    rows.append({
+                        "模型": name,
+                        "集成权重": f"{res['weights'].get(name, 0) * 100:.0f}%",
+                        "RMSE": f"{mt[name]['RMSE']:.3f}",
+                        "MAE": f"{mt[name]['MAE']:.3f}",
+                        "MAPE(%)": f"{mt[name]['MAPE(%)']:.1f}",
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.caption("系统按回测 RMSE 逆误差加权自动集成三个模型：权重越高代表该模型在历史验证集上越可靠。")
 
 
     # ================= 页面：工艺流程图看板（P&ID 暗色数字孪生） =================
@@ -3606,52 +3706,6 @@ if st is not None:
             _al_html += '</div>'
             st.markdown(_al_html, unsafe_allow_html=True)
 
-        # ================= 全宽：近 24 小时运行趋势（独立于三列，铺满页面宽度） =================
-        st.markdown('<div class="cp-panel"><div class="cp-title">📈 近 24 小时运行趋势 <small>TREND · 24H · 全览</small></div>', unsafe_allow_html=True)
-        if go:
-            _df24 = df_flow.tail(24).copy()
-            _df24["小时"] = _df24["时间"].dt.strftime("%H:%M") if "时间" in _df24.columns else [str(i) for i in range(len(_df24))]
-            _cod_in_max = max(_df24.get("进水COD(mg/L)", pd.Series([50])).max() * 1.1, 100)
-            _tn_max = max(_df24.get("出水TN(mg/L)", pd.Series([20])).max() * 1.5, 20)
-
-            fig_trend = go.Figure()
-            fig_trend.add_trace(go.Scatter(
-                x=_df24["小时"], y=_df24.get("进水COD(mg/L)", pd.Series([0]*len(_df24))),
-                name="进水 COD", mode="lines+markers", line=dict(color="#a78bfa", width=2),
-                marker=dict(size=5, symbol="circle")))
-            fig_trend.add_trace(go.Scatter(
-                x=_df24["小时"], y=_df24.get("出水COD(mg/L)", pd.Series([0]*len(_df24))),
-                name="出水 COD", mode="lines+markers", line=dict(color="#22d3ee", width=2),
-                marker=dict(size=5, symbol="circle")))
-            fig_trend.add_trace(go.Scatter(
-                x=_df24["小时"], y=_df24.get("出水TN(mg/L)", pd.Series([0]*len(_df24))),
-                name="出水 TN", mode="lines+markers", line=dict(color="#f472b6", width=2),
-                marker=dict(size=5, symbol="diamond"), yaxis="y2"))
-            fig_trend.add_trace(go.Scatter(
-                x=_df24["小时"], y=_df24.get("跨膜压差(kPa)", pd.Series([0]*len(_df24))),
-                name="UF TMP", mode="lines+markers", line=dict(color="#eab308", width=2),
-                marker=dict(size=5, symbol="square"), yaxis="y3"))
-
-            fig_trend.update_layout(
-                xaxis=dict(title="时间", showgrid=True, gridcolor="rgba(148,163,184,0.12)",
-                           tickangle=-30, color="#cbd5e1"),
-                yaxis=dict(title="COD (mg/L)", showgrid=True, gridcolor="rgba(148,163,184,0.12)",
-                           color="#a78bfa", range=[0, _cod_in_max]),
-                yaxis2=dict(title="TN (mg/L)", overlaying="y", side="right", color="#f472b6",
-                            range=[0, _tn_max]),
-                yaxis3=dict(title="TMP (kPa)", overlaying="y", side="right", color="#eab308",
-                            anchor="free", position=0.98, range=[0, 50]),
-                legend=dict(orientation="h", x=0.5, y=1.08, xanchor="center", font=dict(color="#94a3b8")),
-                plot_bgcolor="rgba(15,23,42,0.45)", paper_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#e2e8f0", family="Microsoft YaHei"),
-                margin=dict(l=50, r=60, t=40, b=40), height=380
-            )
-            fig_trend.add_hline(y=30, line=dict(color="#ef4444", width=1, dash="dash"))
-            fig_trend.add_hline(y=15, line=dict(color="#f472b6", width=1, dash="dash"), yref="y2")
-            st.plotly_chart(fig_trend, use_container_width=True)
-        else:
-            st.warning("缺少 plotly，无法显示趋势图。")
-        st.markdown('</div>', unsafe_allow_html=True)
 
         # ================= 底部 KPI 指标条 =================
         _cod_rem = _rem(cod_in, cod_out)
