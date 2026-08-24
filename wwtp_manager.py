@@ -3170,7 +3170,10 @@ if st is not None:
           var b = parseFloat(baseStr);
           if (isNaN(b)) return null;
           var noise = rel * (Math.random()*2 - 1) * 0.5;
-          jcache[baseStr] = b * (1 + slow + noise);
+          var v = b * (1 + slow + noise);
+          // 百分比类（去除率/达标率/运行指数等 base∈[50,100]）上限锁 100，避免越界
+          if (b >= 50 && b <= 100) v = Math.min(100, v);
+          jcache[baseStr] = v;
         }
         return jcache[baseStr];
       }
@@ -3674,7 +3677,7 @@ if st is not None:
             f'<div class="kpi-box"><div class="v">{_j(_nh3_rem, 1)}%</div><div class="l">NH₃-N 去除率</div></div>'
             f'<div class="kpi-box"><div class="v">{_kwh_m3:.3f}</div><div class="l">吨水电耗 (kWh/m³)</div></div>'
             f'<div class="kpi-box"><div class="v">{_kg_m3:.3f}</div><div class="l">吨水药耗 (kg/m³)</div></div>'
-            f'<div class="kpi-box"><div class="v">{latest.get("UF出水浊度(NTU)", 0):.2f}</div><div class="l">UF 出水浊度 (NTU)</div></div>'
+            f'<div class="kpi-box"><div class="v">{_j(latest.get("UF出水浊度(NTU)", 0.04), 3)}</div><div class="l">UF 出水浊度 (NTU)</div></div>'
             f'<div class="kpi-box"><div class="v">{_run_days}</div><div class="l">连续运行 (天)</div></div>'
             '</div>'
         )
