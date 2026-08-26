@@ -440,18 +440,18 @@ def _rule_reply(q, ctx):
             "反硝化碳": 2, "cod当量": 2,
         }, "【碳源建议】当进水 C/N<4 时需补充外加碳源；优先选 COD 当量高、单价低的碳源"
            "（如甲醇 COD 当量 1.5）。反硝化每去除 1 mg/L NO₃-N 约需 2.86 mg/L COD。"
-           "详见『生化核心计算-碳源投加计算』。"),
+           "详见『AI 工艺体检中心-碳源投加计算』。"),
         ("化学除磷", {
             "除磷": 3, "化学除磷": 3, "磷": 2, "tp": 2, "pac": 2, "pfs": 2,
             "铝盐": 2, "铁盐": 2, "总磷": 2, "bio-p": 1, "释磷": 2, "厌氧除磷": 1,
         }, "【除磷建议】生物除磷约去除 70% 总磷，剩余需化学除磷；铝盐(PAC)/铁盐(PFS)"
            "按摩尔比安全系数 1.5 核算。厌氧段应严格控制 DO<0.2 mg/L 避免抑制释磷。"
-           "详见『生化核心计算-除磷药剂计算』。"),
+           "详见『AI 工艺体检中心-除磷药剂计算』。"),
         ("回流与脱氮", {
             "回流": 3, "内回流": 3, "r1": 3, "总氮": 2, "tn": 2, "脱氮": 3,
             "反硝化": 2, "硝态氮": 2, "缺氧": 1, "硝酸盐": 1, "氮去除": 2, "深度脱氮": 2,
         }, "【脱氮建议】总氮深度达标依赖内回流 R1 将硝态氮带回缺氧池反硝化；R1 不足时加大 R1"
-           "至达标所需最小值。第一缺氧池 DO 应<0.5 mg/L。详见『生化核心计算-回流比校核』。"),
+           "至达标所需最小值。第一缺氧池 DO 应<0.5 mg/L。详见『AI 工艺体检中心-回流比校核』。"),
         ("成本与优化", {
             "成本": 3, "费用": 3, "药耗": 3, "电费": 2, "优化": 2, "节约": 2,
             "药剂": 2, "能耗": 2, "曝气": 2, "省钱": 3, "运行费": 2, "降本": 3,
@@ -597,6 +597,242 @@ def _norm_cdf(x):
     return 0.5 * (1.0 + np.sign(x) * np.sqrt(np.clip(1.0 - np.exp(-2.0 * x * x / np.pi), 0.0, 1.0)))
 
 
+# ============================================================
+# AI 工艺体检中心 —— 统一工况参数 → 水力/生化/二沉池三维度体检（纯函数，可单测）
+# ============================================================
+def _ai_health_check(state):
+    """输入统一工况参数字典，输出三维度体检报告。
+    state 字段：bp(base_params) / q_act / cod_in / bod_in / tn_in / nh3_in / tp_in /
+                tn_target / tp_target / mlss / r_ratio / r1_ratio / sv30 /
+                q_max / s_area / s_depth / waste_vol
+    返回 dict：{"hydro": {items, summary, advice},
+                "bio":   {items, summary, advice},
+                "settler":{items, summary, advice},
+                "overall": [(sec, title, detail), ...] 按风险优先级
+    items 元素：(icon, title, detail)，icon ∈ {✅, ⚠️}
+    """
+    bp = state["bp"]
+    phos_agent_type = state.get("phos_agent_type", "聚合氯化铝 PAC（铝盐）")
+    carbon_agent_type = state.get("carbon_agent_type", "乙酸钠")
+    Q = max(float(state["q_act"]), 1e-6)
+    cod_in = float(state["cod_in"]); bod_in = float(state["bod_in"])
+    tn_in = float(state["tn_in"]); nh3_in = float(state["nh3_in"]); tp_in = float(state["tp_in"])
+    tn_target = float(state["tn_target"]); tp_target = float(state["tp_target"])
+    mlss = float(state["mlss"])
+    R = float(state["r_ratio"]); R1 = float(state["r1_ratio"])
+    sv30 = float(state["sv30"])
+    q_max = max(float(state["q_max"]), 1e-6)
+    s_area = float(state["s_area"]); s_depth = float(state["s_depth"])
+    waste_vol = float(state["waste_vol"])
+
+    V_aero_total = bp['V_aero1'] + bp['V_aero2']
+    report = {"hydro": {"items": [], "summary": "", "advice": []},
+              "bio": {"items": [], "summary": "", "advice": []},
+              "settler": {"items": [], "summary": "", "advice": []},
+              "overall": []}
+
+    # ---------- 维度 1：水力与负荷 ----------
+    hrt_total = bp['V_total'] / Q * 24
+    hrt_ana = bp['V_ana'] / Q * 24
+    hrt_anox1 = bp['V_anox1'] / Q * 24
+    hrt_aero1 = bp['V_aero1'] / Q * 24
+    hrt_anox2 = bp['V_anox2'] / Q * 24
+    hrt_aero2 = bp['V_aero2'] / Q * 24
+    hrt_aero_total = V_aero_total / Q * 24
+    ns_bod = (bod_in * Q / 1000) / (V_aero_total * mlss / 1000) if V_aero_total > 0 else 0
+    ns_cod = (cod_in * Q / 1000) / (V_aero_total * mlss / 1000) if V_aero_total > 0 else 0
+
+    def _hrt(v, lo, hi, tol=0.20):
+        return "✅" if (lo * (1 - tol) <= v <= hi * (1 + tol)) else "⚠️"
+
+    def _hrt_min(v, lo, tol=0.10):
+        return "✅" if v >= lo * (1 - tol) else "⚠️"
+
+    items = report["hydro"]["items"]
+    items.append((_hrt_min(hrt_total, 12), "生化池总 HRT", f"{hrt_total:.1f} h（要求 ≥12 h）"))
+    items.append((_hrt(hrt_ana, 0.5, 2), "厌氧池 HRT", f"{hrt_ana:.2f} h（推荐 0.5~2 h）"))
+    items.append((_hrt(hrt_anox1, 2, 4), "缺氧1池 HRT", f"{hrt_anox1:.2f} h（推荐 2~4 h）"))
+    items.append((_hrt(hrt_aero1, 4, 12), "好氧1池 HRT", f"{hrt_aero1:.2f} h（推荐 4~12 h）"))
+    items.append((_hrt(hrt_anox2, 2, 4), "缺氧2池 HRT", f"{hrt_anox2:.2f} h（推荐 2~4 h）"))
+    items.append((_hrt(hrt_aero2, 0.5, 2), "好氧2池 HRT", f"{hrt_aero2:.2f} h（推荐 0.5~2 h）"))
+    if ns_bod < 0.05:
+        ns_flag, ns_extra = "⚠️", "负荷过低，污泥易老化"
+    elif ns_bod <= 0.15:
+        ns_flag, ns_extra = "✅", "脱氮除磷适宜范围"
+    else:
+        ns_flag, ns_extra = "⚠️", "负荷过高，硝化效果受影响"
+    items.append((ns_flag, "BOD 污泥负荷", f"Ns={ns_bod:.4f} kg/(kgMLSS·d)（{ns_extra}）"))
+    hydro_advice = []
+    if hrt_aero1 < 4:
+        hydro_advice.append("好氧1池 HRT 偏短，硝化可能不完全——建议提高 MLSS 或核查进水分配")
+    if ns_bod > 0.15:
+        hydro_advice.append("污泥负荷偏高——加大排泥、提高 MLSS 或削峰运行")
+    if ns_bod < 0.05:
+        hydro_advice.append("污泥负荷偏低，易老化——减少排泥、适当降低 MLSS")
+    report["hydro"]["summary"] = ("水力与负荷整体健康。" if all(i[0] == "✅" for i in items)
+                                  else "水力与负荷存在需关注项，详见明细。")
+    report["hydro"]["advice"] = hydro_advice
+
+    # ---------- 维度 2：生化脱氮除磷 ----------
+    no3_res_stage1 = tn_in / (1 + R1)
+    no3_after_anox2 = no3_res_stage1 * (1 - 0.7)
+    tn_theory = no3_after_anox2 + 3
+    min_R1 = (tn_in / tn_target - 1) * 100 if tn_target > 0 else 0
+    cn_ratio = cod_in / tn_in if tn_in > 0 else 99.0
+    cp_ratio = bod_in / tp_in if tp_in > 0 else 99.0
+    tn_remove = tn_in - tn_target
+    need_carbon_total = tn_remove * 4
+    endogenous_carbon = bod_in * 0.5
+    carbon_deficit = 0.0 if cn_ratio >= 4 else max(0.0, need_carbon_total - endogenous_carbon)
+    tp_bio_remove = tp_in * 0.7
+    tp_need_chem = max(0.0, tp_in - tp_bio_remove - tp_target)
+
+    # —— 药剂换算（按所选药剂 dosage_factor / cod_eq，供成本页/PDF 引用）——
+    phos_agent_config = {
+        "聚合氯化铝 PAC（铝盐）": {"dosage_factor": 1.5 * 27 / 31 / 0.1, "price_key": "pac_price"},
+        "聚合硫酸铁 PFS（铁盐）": {"dosage_factor": 1.5 * 56 / 31 / 0.11, "price_key": "pfs_price"},
+    }
+    carbon_agent_config = {
+        "乙酸钠": {"cod_eq": 0.68, "price_key": "naac_price"},
+        "甲醇": {"cod_eq": 1.50, "price_key": "methanol_price"},
+        "葡萄糖": {"cod_eq": 1.06, "price_key": "glucose_price"},
+        "复合碳源": {"cod_eq": 0.85, "price_key": "composite_carbon_price"},
+    }
+    phos_cfg = phos_agent_config.get(phos_agent_type, phos_agent_config["聚合氯化铝 PAC（铝盐）"])
+    phos_dosage = tp_need_chem * phos_cfg["dosage_factor"]       # mg/L（投加浓度）
+    phos_daily = phos_dosage * Q / 1e6                           # 吨/天
+    carbon_cfg = carbon_agent_config.get(carbon_agent_type, carbon_agent_config["乙酸钠"])
+    carbon_dosage = carbon_deficit / carbon_cfg["cod_eq"] if carbon_deficit > 0 else 0.0  # mg/L
+    carbon_daily = carbon_dosage * Q / 1e6                       # 吨/天
+    waste_mlss = mlss * 2
+    # —— 泥龄 SRT（A+C 修正：分母含出水SS流失；双口径：全系统 / 硝化段）——
+    eff_ss = 10.0                                       # 出水SS浓度 (mg/L)，经验默认
+    ss_loss = eff_ss * Q / 1000                        # 出水SS带走的干固体 (kg/d)
+    daily_waste_sludge = waste_vol * waste_mlss / 1000  # 剩余污泥干固体 (kg/d)
+    total_sludge_out = daily_waste_sludge + ss_loss      # 系统每日总排出干固体 (kg/d)
+    sludge_aer1 = bp['V_aero1'] * mlss / 1000           # 好氧1(硝化段)泥量 (kg)
+    sludge_total = bp['V_total'] * mlss / 1000          # 全系统泥量 (kg)
+    srt_system = sludge_total / total_sludge_out if total_sludge_out > 0 else 999.0   # 全系统泥龄
+    srt_nitrif = sludge_aer1 / total_sludge_out if total_sludge_out > 0 else 999.0    # 硝化段泥龄
+    srt = srt_system  # 主口径（成本/AI 助手引用全系统泥龄）
+    cod_eff = 50.0; nh3_eff = 1.5
+    cod_rate = (cod_in - cod_eff) / cod_in * 100 if cod_in > 0 else 90.0
+    nh3_rate = (nh3_in - nh3_eff) / nh3_in * 100 if nh3_in > 0 else 95.0
+    tn_rate = tn_remove / tn_in * 100 if tn_in > 0 else 0.0
+    tp_rate = (tp_in - tp_target) / tp_in * 100 if tp_in > 0 else 0.0
+
+    items = report["bio"]["items"]
+    items.append(("✅" if tn_theory <= tn_target else "⚠️", "出水 TN 达标",
+                  f"理论出水 TN={tn_theory:.2f} mg/L（目标 ≤{tn_target:.1f}）"))
+    items.append(("✅" if R1 * 100 >= min_R1 else "⚠️", "内回流 R1 充足度",
+                  f"当前 R1={R1*100:.0f}% vs 所需最小 {max(min_R1, 100):.0f}%"))
+    items.append(("✅" if cn_ratio >= 4 else "⚠️", "进水 C/N 比",
+                  f"C/N={cn_ratio:.1f}（≥4 内碳充足，无需外碳）"))
+    items.append(("✅" if carbon_deficit <= 0 else "⚠️", "碳源缺口",
+                  f"{carbon_deficit:.1f} mg/L COD（0 表示无需补充）"))
+    items.append(("✅" if cp_ratio >= 17 else "⚠️", "碳磷比 BOD₅/TP",
+                  f"{cp_ratio:.1f}（≥17 生物除磷碳源充足）"))
+    items.append(("✅" if tp_need_chem <= 0 else "⚠️", "化学除磷需求",
+                  f"需化学去除 {tp_need_chem:.2f} mg/L TP（0 表示生物除磷已足够）"))
+    items.append(("✅" if carbon_deficit <= 0 else "⚠️", "外加碳源投加",
+                  (f"{carbon_agent_type} {carbon_dosage:.1f} mg/L（{carbon_daily:.3f} 吨/天）"
+                   if carbon_deficit > 0 else "无需投加")))
+    items.append(("✅" if tp_need_chem <= 0 else "⚠️", "除磷药剂投加",
+                  (f"{phos_agent_type} {phos_dosage:.1f} mg/L（{phos_daily:.3f} 吨/天）"
+                   if tp_need_chem > 0 else "无需投加")))
+    if srt_system >= 900:
+        _srt_icon, _srt_note = "⚠️", "排泥量极小，泥龄极长（>900 d），污泥严重老化"
+    elif 10 < srt_system <= 30:
+        _srt_icon, _srt_note = "✅", "脱氮除磷适宜范围"
+    elif srt_system <= 10:
+        _srt_icon, _srt_note = "⚠️", "泥龄过短，硝化菌易流失"
+    elif srt_system > 60:
+        _srt_icon, _srt_note = "⚠️", "排泥不足，泥龄过长——建议加大排泥至 SRT≈20 d"
+    else:
+        _srt_icon, _srt_note = "⚠️", "泥龄偏长，注意污泥老化与除磷失效"
+    items.append((_srt_icon, "全系统泥龄 SRT",
+                  f"{srt_system:.1f} d（合理 10~30 d；{_srt_note}）"))
+    items.append(("✅" if 5 < srt_nitrif < 900 else "⚠️", "硝化段泥龄（好氧1池）",
+                  f"{srt_nitrif:.1f} d（>5 d 即可维持硝化菌；全系统 SRT 的组成段）"))
+    items.append(("✅" if nh3_rate >= 85 else "⚠️", "氨氮去除率",
+                  f"{nh3_rate:.1f}%（要求 ≥85%）"))
+    bio_advice = []
+    if tn_theory > tn_target:
+        bio_advice.append(f"出水 TN 超目标：建议将内回流 R1 上调至约 {max(min_R1, 100)+20:.0f}%（当前 {R1*100:.0f}%）")
+    if carbon_deficit > 0:
+        bio_advice.append(f"需补充外加碳源约 {carbon_deficit:.1f} mg/L COD（乙酸钠或甲醇，按反硝化缺口核算）")
+    if cp_ratio < 17:
+        bio_advice.append("碳磷比不足，厌氧释磷受限——补碳源或强化生物除磷段")
+    if tp_need_chem > 0:
+        bio_advice.append(f"化学除磷需投加 PAC/PFS 去除 {tp_need_chem:.2f} mg/L TP")
+    if srt_system <= 10:
+        bio_advice.append("全系统泥龄过短——减少排泥或提高 MLSS，保障硝化菌世代时间")
+    if srt_system > 60:
+        bio_advice.append("全系统泥龄过长（排泥不足）——加大排泥至 SRT≈20 d，避免污泥老化、生物除磷失效与能耗升高")
+    report["bio"]["summary"] = ("生化系统运行良好。" if all(i[0] == "✅" for i in items)
+                                else "生化系统存在优化空间，详见明细。")
+    report["bio"]["advice"] = bio_advice
+
+    # ---------- 维度 3：二沉池 ----------
+    q_surface = q_max / s_area if s_area > 0 else 0
+    ssl = q_max * (1 + R) * mlss / 1000 / s_area * 24 if s_area > 0 else 0
+    hrt_set = s_area * s_depth / q_max
+    svi = sv30 * 10 / (mlss / 1000) if mlss > 0 else 0
+    items = report["settler"]["items"]
+    items.append(("✅" if q_surface < 1.5 else "⚠️", "表面水力负荷",
+                  f"{q_surface:.3f} m³/(m²·h)（最大时上限 1.5）"))
+    items.append(("✅" if ssl < 150 else "⚠️", "固体表面负荷",
+                  f"{ssl:.2f} kgMLSS/(m²·d)（上限 150）"))
+    items.append(("✅" if 70 < svi < 150 else "⚠️", "SVI 沉降性能",
+                  f"SVI={svi:.1f} mL/g（正常 70~150）"))
+    items.append(("✅" if hrt_set >= 1.5 else "⚠️", "二沉池 HRT",
+                  f"{hrt_set:.2f} h（要求 ≥1.5~2.0 h）"))
+    settler_advice = []
+    if svi >= 150:
+        settler_advice.append("SVI 过高，污泥膨胀风险——降低 MLSS、加大排泥、提高好氧池 DO、控制有机负荷")
+    elif svi < 70:
+        settler_advice.append("SVI 过低，污泥老化——减少排泥、提高污泥负荷、检查进水营养比")
+    if ssl >= 150:
+        settler_advice.append("固体负荷过高，跑泥风险——提高污泥回流比、降低进水量、增加排泥频次")
+    if hrt_set < 1.5:
+        settler_advice.append("二沉池 HRT 偏短——核查最大时流量与池容匹配性")
+    report["settler"]["summary"] = ("二沉池运行正常。" if all(i[0] == "✅" for i in items)
+                                    else "二沉池存在需关注项，详见明细。")
+    report["settler"]["advice"] = settler_advice
+
+    # ---------- 综合建议（风险项优先，其次优化建议；去重） ----------
+    overall = []
+    for sec in ("hydro", "bio", "settler"):
+        for icon, title, detail in report[sec]["items"]:
+            if icon == "⚠️":
+                overall.append((sec, title, detail))
+    for sec in ("hydro", "bio", "settler"):
+        for adv in report[sec]["advice"]:
+            overall.append((sec, "优化建议", adv))
+    seen, overall_u = set(), []
+    for item in overall:
+        k = (item[0], item[2])
+        if k not in seen:
+            seen.add(k)
+            overall_u.append(item)
+    report["overall"] = overall_u
+
+    # ---------- 结构化数值（供页面写回 session_state，成本/报表/AI 助手引用） ----------
+    report["values"] = {
+        "hrt_total": hrt_total, "ns_bod": ns_bod,
+        "tn_theory": tn_theory, "srt": srt_system, "srt_nitrif": srt_nitrif,
+        "cn_ratio": cn_ratio,
+        "carbon_deficit": carbon_deficit, "min_R1": min_R1,
+        "tp_need_chem": tp_need_chem, "cod_rate": cod_rate, "nh3_rate": nh3_rate,
+        "q_surface": q_surface, "ssl": ssl, "svi": svi, "hrt_settler": hrt_set,
+        "sludge_dry_daily": daily_waste_sludge,
+        "sludge_wet_daily": daily_waste_sludge / 0.008 / 1000,
+        "phos_agent_name": phos_agent_type, "carbon_agent_name": carbon_agent_type,
+        "phos_daily": phos_daily, "carbon_daily": carbon_daily,
+    }
+    return report
+
+
 def mechanism_advice(var, bio=None):
     """根据超标变量给出机理联动处置建议（纯函数，bio 为生化计算结果 dict）。"""
     v = (var or "")
@@ -612,7 +848,7 @@ def mechanism_advice(var, bio=None):
         return "氨氮超标多因硝化不足：建议提高好氧1池 DO 至 2~3 mg/L、延长 SRT>10 d、必要时提高 MLSS。"
     if "cod" in vl:
         return "出水 COD 偏高可能与二沉池泥水分离或前置生化不完全有关：检查二沉池泥位/回流比，确认好氧段曝气充足。"
-    return "建议结合『生化核心计算』复核回流比、碳源与除磷药剂投加，并关注二沉池运行状况。"
+    return "建议结合『AI 工艺体检中心』复核回流比、碳源与除磷药剂投加，并关注二沉池运行状况。"
 
 
 def influent_surge_note(var, series, forecast, season=24):
@@ -1123,7 +1359,7 @@ def export_pdf_report(bp, bio, cost):
         t2.setStyle(_table_style())
         flow.append(t2)
     else:
-        flow.append(Paragraph("暂无生化计算数据，请先完成「生化核心计算」页面。", st_body))
+        flow.append(Paragraph("暂无生化计算数据，请先完成「AI 工艺体检中心」页面。", st_body))
     flow.append(PageBreak())
 
     # ---------- 三、成本 + 饼图 ----------
@@ -1196,7 +1432,7 @@ def export_pdf_report(bp, bio, cost):
             bullets.append(f"需化学除磷：化学除磷需求 {bio['tp_need_chem']:.2f} mg/L，"
                            f"建议投加 {bio['phos_agent_name']}（{bio['phos_daily']:.3f} 吨/天）。")
     else:
-        bullets.append("暂无可分析的生化结果，请先完成「生化核心计算」。")
+        bullets.append("暂无可分析的生化结果，请先完成「AI 工艺体检中心」。")
     bullets.append("本报告由 AI 辅助运维系统自动汇总，计算公式基于五段 Bardenpho 工艺经验模型，仅供参考，"
                    "实际运行请以现场监测为准。")
     for b in bullets:
@@ -1795,6 +2031,10 @@ if st is not None:
             'naclo_price': 450,    # 次氯酸钠单价 元/吨
             'pam_price': 12000,     # PAM单价 元/吨
             'hcl_price': 200,       # 盐酸单价 元/吨（pH调节）
+            # 膜组件配置（浸没式超滤）
+            'area_per_module': 18.0,  # 单支膜组件面积 m²
+            'modules_per_rack': 42,   # 单膜箱/膜架组件数
+            'rack_count': 40,         # 膜箱/膜架数量
             'sludge_dispose_price': 220,  # 污泥处置单价 元/吨湿泥
             'staff_num': 12,        # 运维人数
             'staff_salary': 6800,   # 人均月薪 元
@@ -1853,9 +2093,7 @@ if st is not None:
             [
                 "🛰️ 数字孪生驾驶舱",
                 "📝 基础参数设置",
-                "💧 水力与负荷校核",
-                "🧪 生化核心计算",
-                "🏞️ 二沉池专项校核",
+                "🏭 AI 工艺体检中心",
                 "💠 浸没式超滤工况",
                 "💰 成本经济核算",
                 "🔮 AI 预测预警",
@@ -1874,9 +2112,10 @@ if st is not None:
     # ================= 页面1：基础参数设置 =================
     if page == "📝 基础参数设置":
         st.header("📝 基础信息参数设置")
-        st.caption("一次性录入水厂设计参数、动力学系数、经济单价，全局所有模块自动调用")
+        st.caption("一次性录入水厂设计参数、动力学系数、膜组件配置、经济单价，全局所有模块自动调用")
 
-        col1, col2 = st.columns(2)
+        # ---------- 三列对称布局：水量池体 | 动力学+膜组件 | 经济成本 ----------
+        col1, col2, col3 = st.columns(3)
 
         with col1:
             st.subheader("一、水量与池体参数")
@@ -1884,8 +2123,7 @@ if st is not None:
             Q_actual = num_input("实际日均进水量 (m³/d)", value=st.session_state.base_params['Q_actual'], min_value=0.0)
             Kz = num_input("总变化系数 Kz", value=st.session_state.base_params['Kz'], min_value=0.0)
             Q_max = num_input("最大时流量 (m³/h)", value=st.session_state.base_params['Q_max'], min_value=0.0)
-
-            st.markdown("#### 各池有效容积 (m³)")
+            st.markdown("**各池有效容积 (m³)**")
             V_ana = num_input("厌氧池", value=st.session_state.base_params['V_ana'], min_value=0.0)
             V_anox1 = num_input("第一缺氧池", value=st.session_state.base_params['V_anox1'], min_value=0.0)
             V_aero1 = num_input("第一好氧池", value=st.session_state.base_params['V_aero1'], min_value=0.0)
@@ -1895,6 +2133,7 @@ if st is not None:
             settler_area = num_input("二沉池总表面积 (m²)", value=st.session_state.base_params['settler_area'], min_value=0.0)
             settler_depth = num_input("二沉池有效水深 (m)", value=st.session_state.base_params['settler_depth'], min_value=0.0)
 
+        with col2:
             st.subheader("二、生化动力学系数")
             Y = num_input("污泥产率系数 Y", value=st.session_state.base_params['Y'], min_value=0.0)
             Kd = num_input("内源衰减系数 Kd (d⁻¹)", value=st.session_state.base_params['Kd'], min_value=0.0)
@@ -1904,8 +2143,18 @@ if st is not None:
             carbon_cod_eq = num_input("碳源COD当量基准值 (gCOD/g药剂)",
                                             value=st.session_state.base_params['carbon_cod_eq'], min_value=0.0)
 
-        with col2:
-            st.subheader("三、经济成本参数")
+            st.subheader("三、膜组件配置")
+            area_per_module = num_input("单支膜组件面积 (m²)",
+                                         value=st.session_state.base_params['area_per_module'], min_value=0.0)
+            modules_per_rack = num_input("单膜箱/膜架组件数",
+                                          value=st.session_state.base_params['modules_per_rack'], min_value=1)
+            rack_count = num_input("膜箱/膜架数量",
+                                    value=st.session_state.base_params['rack_count'], min_value=1)
+            st.caption(f"已安装膜面积 ≈ **{area_per_module*modules_per_rack*rack_count:.0f} m²** "
+                       f"（{modules_per_rack:.0f} × {rack_count:.0f} 支组件）")
+
+        with col3:
+            st.subheader("四、经济成本参数")
             elec_price = num_input("电价 (元/kWh)", value=st.session_state.base_params['elec_price'], min_value=0.0)
             # 除磷药剂双价格
             pac_price = num_input("PAC铝盐单价 (元/吨)", value=st.session_state.base_params['pac_price'], min_value=0.0)
@@ -1937,6 +2186,10 @@ if st is not None:
                 'settler_area': settler_area, 'settler_depth': settler_depth,
                 'Y': Y, 'Kd': Kd, 'nitr_rate': nitr_rate, 'denitr_rate': denitr_rate,
                 'mlvss_mlss': mlvss_mlss, 'carbon_cod_eq': carbon_cod_eq,
+                # 膜组件配置（浸没式超滤）
+                'area_per_module': area_per_module,
+                'modules_per_rack': modules_per_rack,
+                'rack_count': rack_count,
                 'elec_price': elec_price,
                 # 除磷药剂
                 'pac_price': pac_price,
@@ -1966,458 +2219,133 @@ if st is not None:
                 st.success("✅ 所有基础参数已保存，全部计算模块将自动调用")
 
 
-    # ================= 页面2：水力与负荷校核 =================
-    elif page == "💧 水力与负荷校核":
-        st.header("💧 水力停留时间与负荷校核")
+    # ================= 页面：AI 工艺体检中心（水力+生化+二沉池 三维度合一） =================
+    elif page == "🏭 AI 工艺体检中心":
+        st.header("🏭 AI 工艺体检中心")
+        st.caption("一次输入全面工况参数，AI 自动完成「水力 · 生化 · 二沉池」三维度体检，"
+                   "输出状态诊断与优化建议——替代传统逐页手动校核")
         bp = st.session_state.base_params
+        _bio = st.session_state.get('bio_result') or {}
 
-        st.subheader("一、进水水质与运行参数")
-        col1, col2, col3, col4, col5, col6 = st.columns(6)
-        with col1: cod_in = num_input("进水COD (mg/L)", value=350)
-        with col2: bod_in = num_input("进水BOD5 (mg/L)", value=180)
-        with col3: tn_in = num_input("进水总氮 TN (mg/L)", value=40)
-        with col4: nh3_in = num_input("进水氨氮 NH3-N (mg/L)", value=28)
-        with col5: tp_in = num_input("进水总磷 TP (mg/L)", value=5)
-        with col6: mlss = num_input("MLSS (mg/L)", value=3500)
+        # ---------- ① 统一工况参数（自动取数 + 可覆盖） ----------
+        st.subheader("① 工况参数")
+        with st.expander("⚙️ 工况参数（默认自动取数，可手动覆盖）", expanded=True):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                q_act = num_input("实际水量 (m³/d)", value=float(bp['Q_actual']), min_value=0.0, key="hc_q")
+                cod_in = num_input("进水COD (mg/L)", value=200.0, min_value=0.0, key="hc_cod")
+                bod_in = num_input("进水BOD5 (mg/L)", value=120.0, min_value=0.0, key="hc_bod")
+                tn_in = num_input("进水TN (mg/L)", value=40.0, min_value=0.0, key="hc_tn")
+                nh3_in = num_input("进水NH3-N (mg/L)", value=28.0, min_value=0.0, key="hc_nh3")
+                tp_in = num_input("进水TP (mg/L)", value=5.0, min_value=0.0, key="hc_tp")
+            with c2:
+                tn_target = num_input("出水TN目标 (mg/L)", value=10.0, min_value=0.0, key="hc_tnt")
+                tp_target = num_input("出水TP目标 (mg/L)", value=0.2, min_value=0.0, key="hc_tpt")
+                mlss = num_input("MLSS (mg/L)", value=3500.0, min_value=0.0, key="hc_mlss")
+                r_pct = num_input("污泥回流比 R (%)", value=100.0, min_value=0.0, key="hc_r")
+                r1_pct = num_input("内回流比 R1 (%)", value=200.0, min_value=0.0, key="hc_r1")
+                sv30 = num_input("SV30 (%)", value=25.0, min_value=0.0, key="hc_sv30")
+            with c3:
+                q_max = num_input("最大时流量 (m³/h)", value=float(bp['Q_max']), min_value=0.0, key="hc_qmax")
+                s_area = num_input("二沉池面积 (m²)", value=float(bp['settler_area']), min_value=0.0, key="hc_area")
+                s_depth = num_input("二沉池水深 (m)", value=float(bp['settler_depth']), min_value=0.0, key="hc_depth")
+                # 排泥默认值：按全系统泥龄 SRT≈20 d 反算湿泥量 (m³/d)，避免"20 m³ 偏小→泥龄虚高"
+                _waste_def = (bp['V_total'] * mlss / 1000) / 20.0 / 0.008 / 1000
+                waste_vol = num_input("外排剩余污泥 (m³/d)",
+                                      value=float(_bio.get('daily_waste_sludge_vol') or _waste_def),
+                                      min_value=0.0, key="hc_waste",
+                                      help="默认按全系统泥龄 SRT≈20 d 反算排泥量；如输入实际运行排泥量，AI 将如实评估泥龄")
+            # 药剂选择（影响投加量与成本核算，成本页自动联动）
+            st.markdown("**药剂选择（影响投加量与成本核算）**")
+            ca1, ca2 = st.columns(2)
+            with ca1:
+                phos_agent_type = st.selectbox(
+                    "除磷药剂类型",
+                    ["聚合氯化铝 PAC（铝盐）", "聚合硫酸铁 PFS（铁盐）"],
+                    index=0, key="hc_phos")
+            with ca2:
+                carbon_agent_type = st.selectbox(
+                    "外加碳源类型",
+                    ["乙酸钠", "甲醇", "葡萄糖", "复合碳源"],
+                    index=0, key="hc_carb")
+            st.caption("💡 参数已自动取数（基础参数/生化计算结果）；排泥量默认按 SRT≈20 d 反算，可手动覆盖。")
 
-        if st.button("开始校核计算", type="primary"):
-            Q = bp['Q_actual']
-            V_aero_total = bp['V_aero1'] + bp['V_aero2']   # 曝气池总容积 = 好氧1 + 好氧2
-
-            # ========== 1. 水力停留时间HRT ==========
-            hrt_total = bp['V_total'] / Q * 24
-            hrt_ana = bp['V_ana'] / Q * 24
-            hrt_anox1 = bp['V_anox1'] / Q * 24
-            hrt_aero1 = bp['V_aero1'] / Q * 24
-            hrt_anox2 = bp['V_anox2'] / Q * 24
-            hrt_aero2 = bp['V_aero2'] / Q * 24
-            hrt_aero_total = V_aero_total / Q * 24
-
-            # HRT判定（采用±20%容差：严格在范围内为合理，边界附近为临界，否则为偏离）
-            hrt_total_status = _judge_hrt_min(hrt_total, 12, tol=0.10)
-            hrt_ana_status = _judge_hrt(hrt_ana, 0.5, 2, tol=0.20)
-            hrt_anox1_status = _judge_hrt(hrt_anox1, 2, 4, tol=0.20)
-            hrt_aero1_status = _judge_hrt(hrt_aero1, 4, 12, tol=0.20)
-            hrt_anox2_status = _judge_hrt(hrt_anox2, 2, 4, tol=0.20)
-            hrt_aero2_status = _judge_hrt(hrt_aero2, 0.5, 2, tol=0.20)
-
-
-            # ========== 3. 污泥负荷 ==========
-            # BOD污泥负荷 Ns = 日BOD总量 / 曝气池MLSS总质量  单位：kgBOD/(kgMLSS·d)
-            ns_bod = (bod_in * Q / 1000) / (V_aero_total * mlss / 1000)
-            # COD污泥负荷
-            ns_cod = (cod_in * Q / 1000) / (V_aero_total * mlss / 1000)
-
-            # 污泥负荷判定
-            if ns_bod < 0.05:
-                ns_status = "⚠️ 负荷过低，污泥易老化"
-            elif 0.05 <= ns_bod <= 0.15:
-                ns_status = "✅ 脱氮除磷适宜范围"
-            else:
-                ns_status = "⚠️ 负荷过高，硝化效果受影响"
-
-            # ========== 结果存储（持久化，供切换页面后展示） ==========
-            conclusion = f"""
-            当前工况下，五段Bardenpho(或Phoredox)系统水力停留时间{hrt_total_status.replace('✅ ','').replace('⚠️ ','')}脱氮除磷要求；
-            污泥负荷{ns_status.replace('✅ ','').replace('⚠️ ','')}；
-            若进水浓度进一步升高，可通过提高MLSS、调控溶解氧、加大内回流比、调整外回流比、补充外加碳源、投加除磷剂等措施保障出水达标。
-            """
-            st.session_state.hydro_result = {
-                'schema': RESULT_SCHEMA,
-                'hrt_total': hrt_total, 'hrt_ana': hrt_ana, 'hrt_anox1': hrt_anox1,
-                'hrt_aero1': hrt_aero1, 'hrt_anox2': hrt_anox2, 'hrt_aero2': hrt_aero2,
-                'hrt_aero_total': hrt_aero_total,
-                'hrt_total_status': hrt_total_status, 'hrt_ana_status': hrt_ana_status,
-                'hrt_anox1_status': hrt_anox1_status, 'hrt_aero1_status': hrt_aero1_status,
-                'hrt_anox2_status': hrt_anox2_status, 'hrt_aero2_status': hrt_aero2_status,
-                'ns_bod': ns_bod, 'ns_cod': ns_cod, 'ns_status': ns_status,
-                'conclusion': conclusion
+        # ---------- ② 一键生成体检报告 ----------
+        st.markdown("---")
+        if st.button("🔍 一键生成 AI 工艺体检报告", type="primary", use_container_width=True):
+            state = {
+                "bp": bp, "q_act": q_act, "cod_in": cod_in, "bod_in": bod_in,
+                "tn_in": tn_in, "nh3_in": nh3_in, "tp_in": tp_in,
+                "tn_target": tn_target, "tp_target": tp_target,
+                "mlss": mlss, "r_ratio": r_pct / 100, "r1_ratio": r1_pct / 100,
+                "sv30": sv30, "q_max": q_max, "s_area": s_area,
+                "s_depth": s_depth, "waste_vol": waste_vol,
+                "phos_agent_type": phos_agent_type, "carbon_agent_type": carbon_agent_type,
             }
-
-
-
-        # ===== 持久展示：切换页面后仍保留计算结果 =====
-        _hydro_stale = bool(st.session_state.get('hydro_result')) and st.session_state.hydro_result.get('schema') != RESULT_SCHEMA
-        if _hydro_stale:
-            st.info("计算结果格式已更新，请重新点击本页「开始校核计算」按钮以刷新结果。")
-        if st.session_state.get('hydro_result') and st.session_state.get('hydro_result').get('schema') == RESULT_SCHEMA:
-            res = st.session_state.hydro_result
-            st.markdown("---")
-            tab1, tab2 = st.tabs(["水力停留时间(HRT)", "污泥负荷校核"])
-            with tab1:
-                st.subheader("1. 各功能区水力停留时间")
-                hrt_df = pd.DataFrame({
-                    "功能区": ["厌氧池", "第一缺氧池", "第一好氧池", "第二缺氧池", "第二好氧池", "曝气池合计", "生化池总HRT"],
-                    "停留时间 (h)": [res['hrt_ana'], res['hrt_anox1'], res['hrt_aero1'], res['hrt_anox2'], res['hrt_aero2'], res['hrt_aero_total'], res['hrt_total']],
-                    "推荐范围 (h)": ["0.5~2", "2~4", "4~12", "2~4", "0.5~2", "4.5~14", "≥12"],
-                    "判定": [res['hrt_ana_status'], res['hrt_anox1_status'], res['hrt_aero1_status'], res['hrt_anox2_status'], res['hrt_aero2_status'], "—", res['hrt_total_status']]
-                })
-                st.dataframe(hrt_df, use_container_width=True, hide_index=True)
-                st.info("第二好氧池仅用于吹脱氮气与维持DO，不承担硝化功能，停留时间按短HRT设计")
-
-            with tab2:
-                st.subheader("2. 系统污泥负荷校核")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("BOD污泥负荷 Ns", f"{res['ns_bod']:.4f} kgBOD/(kgMLSS·d)")
-                    st.info(res['ns_status'])
-                    st.caption("脱氮除磷工艺推荐污泥负荷：0.05~0.15 kgBOD/(kgMLSS·d)")
-                with col2:
-                    st.metric("COD污泥负荷", f"{res['ns_cod']:.4f} kgCOD/(kgMLSS·d)")
-
-                st.markdown("---")
-                st.write("**污泥负荷调控建议：**")
-                st.write("- 负荷过高：加大排泥、提高MLSS、降低进水负荷")
-                st.write("- 负荷过低：减少排泥、降低MLSS、缩短污泥龄，防止污泥老化解体")
-
-            st.markdown("---")
-            st.subheader("二、综合校核结论")
-            st.write(res['conclusion'])
-
-    # ================= 页面3：生化核心计算 =================
-    elif page == "🧪 生化核心计算":
-        st.header("🧪 五段Bardenpho生化系统核心计算")
-        bp = st.session_state.base_params
-
-        st.subheader("一、运行参数输入")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            cod_in = num_input("进水COD (mg/L)", value=210)
-            bod_in = num_input("进水BOD5 (mg/L)", value=130)
-            nh3_in = num_input("进水氨氮 (mg/L)", value=28)
-            tn_in = num_input("进水总氮 TN (mg/L)", value=57)
-            tp_in = num_input("进水总磷 TP (mg/L)", value=5)
-            R1 = num_input("内回流比 R1 (好氧1→缺氧1, %)", value=200) / 100
-            waste_sludge_volume = num_input("每日外排剩余污泥量(m³/d)", value=20.0)
-        with col2:
-            tn_out_target = num_input("出水TN目标 (mg/L)", value=15)
-            tp_out_target = num_input("出水TP目标 (mg/L)", value=0.5)
-            bod_eff = num_input("实际出水BOD5 (mg/L)", value=10)
-            cod_eff = num_input("实际出水COD (mg/L)", value=50)
-            nh3_eff = num_input("实际出水氨氮 (mg/L)", value=1.5)
-            mlss = num_input("MLSS 混合液浓度 (mg/L)", value=3500)
-            R = num_input("污泥回流比 R (%)", value=100) / 100
-
-        with col3:
-            phos_agent_type = st.selectbox("除磷药剂类型", ["聚合氯化铝 PAC（铝盐）", "聚合硫酸铁 PFS（铁盐）"])
-            carbon_agent_type = st.selectbox("外加碳源类型", ["乙酸钠", "甲醇", "葡萄糖", "复合碳源"])
-            st.info("工艺说明：好氧1完成全部硝化，出水自流进入第二缺氧池深度反硝化；第二好氧池仅吹脱氮气、防止二沉池反硝化，不承担硝化功能")
-
-        if st.button("开始生化计算", type="primary"):
-            st.session_state['eff_params'] = {
-                'bod_eff': bod_eff,
-                'cod_eff': cod_eff,
-                'nh3_eff': nh3_eff
-            }
-            Q = bp['Q_actual']
-            f = bp['mlvss_mlss']
-            Y = bp['Y']
-            Kd = bp['Kd']
-            dn_rate = bp['denitr_rate']
-            cod_eq = bp['carbon_cod_eq']
-            V_total = bp['V_total']
-            V_anox1 = bp['V_anox1']
-            V_anox2 = bp['V_anox2']
-
-            # ========== 1. 回流比与脱氮校核 ==========
-            total_return = R + R1   # 仅用于展示"系统总回流倍数"
-            # 脱氮质量平衡：仅内回流R1携带硝态氮回到缺氧池（污泥回流R基本不带硝态氮，不计入）
-            # 缺氧1完全反硝化后，残留TN浓度≈ TN_in / (1 + R1)（已包含硝化生成的氮）
-            no3_res_stage1 = tn_in / (1 + R1)
-            # 自流进入缺氧2深度反硝化（反硝化效率按70%计，该比例依容积/碳源而定）
-            no3_after_anox2 = no3_res_stage1 * (1 - 0.7)
-            # 出水总氮（含残留有机氮、出水氨氮，取3 mg/L近似）
-            tn_theory = no3_after_anox2 + 3
-
-            tn_status = "✅ 当前回流比可满足TN目标" if tn_theory <= tn_out_target else "⚠️ 内回流不足，需加大R1回流比"
-            # 满足出水TN目标所需最小内回流比（基于缺氧1主反硝化段，保守值，仅与R1相关）
-            min_R1 = (tn_in / tn_out_target - 1) * 100
-
-            # ========== 2. 碳源投加量计算 ==========
-            # ========== 药剂参数配置（内置行业标准参数） ==========
-            # 除磷药剂：1mg/L TP所需药剂mg/L（摩尔比安全系数1.5，按工业有效含量换算）
-            phos_agent_config = {
-                "聚合氯化铝 PAC（铝盐）": {
-                    "dosage_factor": 1.5 * 27 / 31 / 0.1,  # Al2O3分子量102，含量28%  ， Al分子量27，磷31，含量10%
-                    "price_key": "pac_price"
-                },
-                "聚合硫酸铁 PFS（铁盐）": {
-                    "dosage_factor": 1.5 * 56 / 31 / 0.11,  # Fe2O3分子量160，含量19%  ， Fe分子量56，磷31，含量11%
-                    "price_key": "pfs_price"
-                }
-            }
-            # 碳源药剂：COD当量（gCOD/g药剂）
-            carbon_agent_config = {
-                "乙酸钠": {"cod_eq": 0.68, "price_key": "naac_price"},
-                "甲醇": {"cod_eq": 1.50, "price_key": "methanol_price"},
-                "葡萄糖": {"cod_eq": 1.06, "price_key": "glucose_price"},
-                "复合碳源": {"cod_eq": 0.85, "price_key": "composite_carbon_price"}
-            }
-
-            # ========== 2. 碳源投加量计算 ==========
-            cn_ratio = cod_in / tn_in
-            tn_remove = tn_in - tn_out_target
-            endogenous_carbon = bod_in * 0.5  # 可生化内源碳（按易降解COD≈50% BOD计，保守取值）
-            need_carbon_total = tn_remove * 4  # 反硝化总需COD（C/N=4，含安全余量；理论最小约2.86 gCOD/gNO3-N）
-
-            # 状态判定与投加量统一以 C/N 阈值为准，避免"界面说无需、却仍算投加量"的矛盾：
-            # COD/TN ≥ 4 视为内碳充足，不外加碳源（缺口强制为0）；C/N < 4 才按反硝化缺口细化计算
-            if cn_ratio >= 4:
-                carbon_deficit = 0.0
-                carbon_status = f"✅ C/N比{cn_ratio:.1f}，无需补充碳源"
-            else:
-                carbon_deficit = max(0, need_carbon_total - endogenous_carbon)
-                carbon_status = f"⚠️ C/N比仅{cn_ratio:.1f}，需补充碳源"
-
-            # 两级缺氧碳源分配 7:3（求和后相互抵消，对总投加量无影响，仅内部拆分）
-            carbon_anox1 = carbon_deficit * 0.7
-            carbon_anox2 = carbon_deficit * 0.3
-            carbon_cfg = carbon_agent_config[carbon_agent_type]
-            carbon_dosage = (carbon_anox1 + carbon_anox2) / carbon_cfg["cod_eq"]  # mg/L
-            carbon_daily = carbon_dosage * Q / 1000 / 1000  # 吨/天
-
-            # ========== 碳磷比计算与判定 ==========
-            cp_ratio = bod_in / tp_in
-            if cp_ratio < 17:
-                cp_status = "⚠️ 碳磷比不足（<17），生物除磷碳源欠缺，需补充碳源强化厌氧释磷"
-                cp_need_carbon = True
-            else:
-                cp_status = "✅ 碳磷比充足（≥17），生物除磷碳源满足需求"
-                cp_need_carbon = False
-
-            # ========== 3. 化学除磷药剂计算 ==========
-            tp_bio_remove = tp_in * 0.7  # 生物除磷70%
-            tp_need_chem = max(0, tp_in - tp_bio_remove - tp_out_target)
-            # 按所选除磷药剂换算投加量
-            phos_cfg = phos_agent_config[phos_agent_type]
-            phos_dosage = tp_need_chem * phos_cfg["dosage_factor"]  # mg/L
-            phos_daily = phos_dosage * Q / 1000 / 1000  # 吨/天
-
-            # ========== 4. 剩余污泥与污泥龄 ==========
-            bod_remove = bod_in - bod_eff
-
-            # --- 4.1 污泥龄 SRT（按实际排泥量计算，仅硝化段‑好氧1池） ---
-            V_aero1 = bp["V_aero1"]
-            waste_mlss = mlss * 2  # 排泥污泥浓度默认是生化池MLSS的2倍
-            aer1_total_sludge = V_aero1 * mlss / 1000          # 好氧1池总污泥质量(kg)
-            daily_waste_sludge = waste_sludge_volume * waste_mlss / 1000  # 每日外排污泥质量(kg/d)
-            if daily_waste_sludge > 0:
-                srt = aer1_total_sludge / daily_waste_sludge
-            else:
-                srt = 999
-
-            # --- 4.2 剩余污泥产量（表观产率系数法，与SRT一致，恒为非负） ---
-            # 注：直接用 ΔX=Y·Q·ΔBOD−Kd·V·X 在MLSS/排泥独立输入时可能出现负值，
-            #      故改用表观产率 Y_obs=Y/(1+Kd·SRT) 关联系统SRT，结果稳定合理。
-            Y_obs = Y / (1 + Kd * srt)
-            delta_x_v = Y_obs * Q * bod_remove / 1000          # kg VSS/d
-            ash_fraction = 0.20
-            delta_x_total = delta_x_v / (1 - ash_fraction)
-            water_content = 0.992
-            dry_ratio = 1 - water_content
-            sludge_wet = delta_x_total / dry_ratio / 1000
-
-
-
-            # ========== 5. 污染物去除率（动态计算，无固定值） ==========
-            cod_rate = (cod_in - cod_eff) / cod_in * 100
-            nh3_rate = (nh3_in - nh3_eff) / nh3_in * 100
-            tn_rate = tn_remove / tn_in * 100
-            tp_rate = (tp_in - tp_out_target) / tp_in * 100
-
-            # 保存结果供成本模块调用（单一赋值，避免重复写入导致键丢失）
+            with st.spinner("AI 正在综合分析水力、生化、二沉池三维度…"):
+                st.session_state.hc_report = _ai_health_check(state)
+            # ---------- 同步关键结果到 session_state（成本/报表/AI 助手引用） ----------
+            _rep = st.session_state.hc_report
+            _vals = _rep["values"]
             st.session_state.bio_result = {
                 'schema': RESULT_SCHEMA,
-                'phos_daily': phos_daily,
-                'phos_agent_name': phos_agent_type,
-                'phos_price_key': phos_cfg["price_key"],
-                'carbon_daily': carbon_daily,
+                'tn_theory': _vals['tn_theory'], 'srt': _vals['srt'],
+                'cn_ratio': _vals['cn_ratio'], 'carbon_deficit': _vals['carbon_deficit'],
+                'min_R1': _vals['min_R1'], 'tp_need_chem': _vals['tp_need_chem'],
+                'cod_rate': _vals['cod_rate'], 'nh3_rate': _vals['nh3_rate'],
+                'sludge_dry_daily': _vals['sludge_dry_daily'],
+                'sludge_wet_daily': _vals['sludge_wet_daily'],
+                'R': r_pct / 100, 'R1': r1_pct / 100,
+                # 药剂（PDF 报表/成本页引用，原生化页 schema 对齐）
                 'carbon_agent_name': carbon_agent_type,
-                'carbon_price_key': carbon_cfg["price_key"],
-                'sludge_dry_daily': delta_x_total,
-                'sludge_wet_daily': sludge_wet,
-                'tn_theory': tn_theory,
-                'srt': srt,
-                'daily_waste_sludge_vol': waste_sludge_volume,
-                'waste_mlss': waste_mlss,
-                # —— 以下为界面持久化展示所需的派生值 ——
-                'R': R, 'R1': R1, 'total_return': total_return,
-                'min_R1': min_R1, 'tn_status': tn_status,
-                'tn_out_target': tn_out_target, 'tp_out_target': tp_out_target,
-                'carbon_agent_type': carbon_agent_type, 'cn_ratio': cn_ratio,
-                'carbon_status': carbon_status, 'cp_ratio': cp_ratio,
-                'cp_need_carbon': cp_need_carbon, 'cp_status': cp_status,
-                'tn_remove': tn_remove, 'need_carbon_total': need_carbon_total,
-                'endogenous_carbon': endogenous_carbon, 'carbon_deficit': carbon_deficit,
-                'carbon_dosage': carbon_dosage,
-                'phos_agent_type': phos_agent_type, 'tp_bio_remove': tp_bio_remove,
-                'tp_need_chem': tp_need_chem, 'phos_dosage': phos_dosage,
-                'cod_rate': cod_rate, 'nh3_rate': nh3_rate, 'tn_rate': tn_rate, 'tp_rate': tp_rate
+                'phos_agent_name': phos_agent_type,
+                'carbon_daily': _vals['carbon_daily'],
+                'phos_daily': _vals['phos_daily'],
+                'tn_out_target': tn_target, 'tp_out_target': tp_target,
+                'tn_status': ('✅ 当前回流比可满足TN目标'
+                              if _vals['tn_theory'] <= tn_target else '⚠️ 内回流不足，需加大R1回流比'),
+                'carbon_status': ('✅ C/N比{:.1f}，无需补充碳源'.format(_vals['cn_ratio'])
+                                  if _vals['cn_ratio'] >= 4 else '⚠️ C/N比{:.1f}，需补充碳源'.format(_vals['cn_ratio'])),
             }
-
-
-
-
-        # ===== 持久展示：切换页面后仍保留计算结果 =====
-        _stale = bool(st.session_state.get('bio_result')) and st.session_state.bio_result.get('schema') != RESULT_SCHEMA
-        if _stale:
-            st.info("计算结果格式已更新，请重新点击本页「计算」按钮以刷新结果。")
-        if st.session_state.get('bio_result') and st.session_state.get('bio_result').get('schema') == RESULT_SCHEMA:
-            bio = st.session_state.get('bio_result')
-            st.markdown("---")
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(["回流比脱氮校核", "DO分区控制", "碳源投加计算", "除磷药剂计算", "污泥与去除率"])
-
-            with tab1:
-                st.subheader("1. 回流比校核与脱氮效果")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("污泥回流比", f"{bio['R']*100:.0f}%")
-                    st.metric("内回流比 R1（好氧1→缺氧1）", f"{bio['R1']*100:.0f}%")
-                    st.metric("系统总回流比 (R+R1)", f"{bio['total_return']:.1f}倍")
-                with col2:
-                    st.metric("理论出水TN", f"{bio['tn_theory']:.2f} mg/L")
-                    st.metric("达标所需最小内回流R1", f"{max(bio['min_R1'], 100):.1f}%")
-                    st.info(bio['tn_status'])
-                st.write("调节建议：氨氮偏高时优先加大内回流R1；总氮深度达标可配合缺氧2外加碳源")
-
-            with tab2:
-                st.subheader("2. 各功能区溶解氧DO控制标准")
-                do_data = pd.DataFrame({
-                    "功能区": ["厌氧池", "第一缺氧池", "第一好氧池", "第二缺氧池", "第二好氧池"],
-                    "DO控制范围 (mg/L)": ["< 0.2", "< 0.5", "1.5 ~ 3.0", "< 0.3", "1.0 ~ 2.0"],
-                    "控制要点": [
-                        "保证聚磷菌释磷环境，DO过高会彻底失效除磷",
-                        "主反硝化区，控制DO减少碳源浪费",
-                        "承担全部硝化功能，保证氨氮充分硝化为硝态氮",
-                        "深度反硝化区，DO要求更严格，避免消耗外加碳源",
-                        "吹脱氮气，维持出水DO，防止二沉池反硝化浮泥，不承担硝化功能"
-                    ]
-                })
-                st.dataframe(do_data, use_container_width=True, hide_index=True)
-
-            with tab3:
-                st.subheader(f"3. 碳源投加量计算（{bio['carbon_agent_type']}）")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("进水C/N比", f"{bio['cn_ratio']:.1f}")
-                    st.info(bio['carbon_status'])
-                    st.metric("进水碳磷比 (BOD₅/TP)", f"{bio['cp_ratio']:.1f}")
-                    if bio['cp_need_carbon']:
-                        st.warning(bio['cp_status'])
-                    else:
-                        st.success(bio['cp_status'])
-                    st.divider()
-                    st.write(f"总需脱除总氮：{bio['tn_remove']:.1f} mg/L")
-                    st.write(f"理论总需COD：{bio['need_carbon_total']:.1f} mg/L")
-                    st.write(f"内源可利用碳源：{bio['endogenous_carbon']:.1f} mg/L")
-                    st.write(f"碳源总缺口：{bio['carbon_deficit']:.1f} mg/L")
-                with col2:
-                    st.metric(f"{bio['carbon_agent_type']}投加浓度", f"{bio['carbon_dosage']:.2f} mg/L")
-                    st.metric(f"{bio['carbon_agent_type']}日投加量", f"{bio['carbon_daily']:.3f} 吨/天")
-
-            with tab4:
-                st.subheader(f"4. 化学除磷药剂计算（{bio['phos_agent_type']}）")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write(f"生物除磷量：{bio['tp_bio_remove']:.2f} mg/L")
-                    st.write(f"需化学去除磷量：{bio['tp_need_chem']:.2f} mg/L")
-                with col2:
-                    st.metric(f"{bio['phos_agent_type']}投加浓度", f"{bio['phos_dosage']:.2f} mg/L")
-                    st.metric(f"{bio['phos_agent_type']}日投加量", f"{bio['phos_daily']:.3f} 吨/天")
-
-            with tab5:
-                st.subheader("5. 剩余污泥、污泥龄与去除率")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("污泥龄 SRT（硝化段）", f"{bio['srt']:.1f} d")
-                    st.info("满足硝化菌世代时间要求" if bio['srt'] > 10 else "泥龄偏短，硝化菌易流失")
-                    st.caption("注：此处SRT仅按硝化段(好氧1池)污泥量/排泥量计算，为硝化安全泥龄下限；全系统SRT需用V_total核算")
-                    st.metric("每日剩余干污泥", f"{bio['sludge_dry_daily']:.2f} kg/d")
-                    st.metric("湿污泥量（含水率99.2%）", f"{bio['sludge_wet_daily']:.2f} m³/d")
-                with col2:
-                    st.write("#### 污染物去除率")
-                    st.write(f"COD去除率：{bio['cod_rate']:.1f}%")
-                    st.write(f"氨氮去除率：{bio['nh3_rate']:.1f}%")
-                    st.write(f"总氮去除率：{bio['tn_rate']:.1f}%")
-                    st.write(f"总磷去除率：{bio['tp_rate']:.1f}%")
-    # ================= 页面4：二沉池专项校核 =================
-    elif page == "🏞️ 二沉池专项校核":
-        st.header("🏞️ 二沉池专项校核")
-        bp = st.session_state.base_params
-
-        col1, col2 = st.columns(2)
-        with col1:
-            mlss = num_input("MLSS 混合液浓度 (mg/L)", value=3500)
-            R = num_input("污泥回流比 R (%)", value=100) / 100
-            sv30 = num_input("SV30 沉降比 (%)", value=25)
-        with col2:
-            Q_max = num_input("最大时流量 (m³/h)", value=bp['Q_max'])
-            area = num_input("二沉池总表面积 (m²)", value=bp['settler_area'])
-            depth = num_input("二沉池有效水深 (m)", value=bp['settler_depth'])
-
-        if st.button("开始校核", type="primary"):
-            # 计算
-            q_surface = Q_max / area  # 表面水力负荷
-            ssl = Q_max * (1+R) * mlss / 1000 / area * 24  # 固体负荷 kg/(m²·d)
-            hrt = area * depth / Q_max  # 停留时间 h
-            svi = sv30 * 10 / (mlss / 1000)  # SVI mL/g
-
-            # 判定
-            q_status = "✅ 表面负荷正常，沉淀效果良好" if q_surface < 1.5 else "⚠️ 表面负荷偏高，出水SS易超标"
-            ssl_status = "✅ 固体负荷在安全范围" if ssl < 150 else "⚠️ 固体负荷过高，易发生跑泥"
-            if 70 < svi < 150:
-                svi_status = "✅ 污泥沉降性能良好"
-            elif svi >= 150:
-                svi_status = "⚠️ SVI过高，存在污泥膨胀风险"
-            else:
-                svi_status = "⚠️ SVI过低，污泥老化"
-
-            st.markdown("---")
-            # 持久化结果，便于切换页面后再次查看
+            st.session_state.hydro_result = {
+                'schema': RESULT_SCHEMA, 'hrt_total': _vals['hrt_total'], 'ns_bod': _vals['ns_bod'],
+            }
             st.session_state.settler_result = {
-                'schema': RESULT_SCHEMA,
-                'q_surface': q_surface, 'q_status': q_status,
-                'ssl': ssl, 'ssl_status': ssl_status,
-                'svi': svi, 'svi_status': svi_status,
-                'hrt': hrt
+                'schema': RESULT_SCHEMA, 'q_surface': _vals['q_surface'],
+                'ssl': _vals['ssl'], 'svi': _vals['svi'], 'hrt': _vals['hrt_settler'],
             }
-            st.success("✅ 二沉池校核完成，结果已保存，可切换页面后再回来查看")
+            st.success("✅ 体检完成，关键结果已同步至全局（成本核算/报表/AI 助手可自动引用）")
 
-
-
-        # ===== 持久展示：切换页面后仍保留计算结果 =====
-        _stale = bool(st.session_state.get('settler_result')) and st.session_state.settler_result.get('schema') != RESULT_SCHEMA
-        if _stale:
-            st.info("计算结果格式已更新，请重新点击本页「计算」按钮以刷新结果。")
-        if st.session_state.get('settler_result') and st.session_state.get('settler_result').get('schema') == RESULT_SCHEMA:
-            res = st.session_state.settler_result
-            st.markdown("---")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("表面水力负荷", f"{res['q_surface']:.3f} m³/(m²·h)")
-                st.info(res['q_status'])
-                st.caption("推荐值：最大时 ≤ 0.6~1.5 m³/(m²·h)")
-            with col2:
-                st.metric("固体表面负荷", f"{res['ssl']:.2f} kgMLSS/(m²·d)")
-                st.info(res['ssl_status'])
-                st.caption("推荐值：≤ 150 kgMLSS/(m²·d)")
-            with col3:
-                st.metric("SVI 污泥体积指数", f"{res['svi']:.1f} mL/g")
-                st.info(res['svi_status'])
-                st.caption("正常范围：70 ~ 150 mL/g")
-
-            st.metric("二沉池水力停留时间 (HRT)", f"{res['hrt']:.2f} h")
-            st.caption("推荐值：按最大时流量校核，一般 ≥ 1.5~2.0 h")
+        # ---------- ③ 报告展示 ----------
+        if st.session_state.get('hc_report'):
+            rep = st.session_state.hc_report
+            st.subheader("② AI 工艺体检报告")
+            _secs = [
+                ("💧 报告 1：水力与负荷状态", "hydro"),
+                ("🧪 报告 2：生化脱氮除磷状态", "bio"),
+                ("🏞️ 报告 3：二沉池运行状态", "settler"),
+            ]
+            for title, key in _secs:
+                with st.expander(title, expanded=(key == "hydro")):
+                    d = rep[key]
+                    st.markdown(f"**{d['summary']}**")
+                    for icon, it, det in d["items"]:
+                        st.markdown(f"- {icon} **{it}**：{det}")
+                    if d["advice"]:
+                        st.markdown("**💡 优化建议：**")
+                        for adv in d["advice"]:
+                            st.markdown(f"  - {adv}")
 
             st.markdown("---")
-            st.subheader("故障处置建议")
-            if res['svi'] >= 150:
-                st.warning("污泥膨胀风险：建议降低MLSS、加大排泥量、提高好氧池DO、控制进水有机负荷")
-            elif res['svi'] < 70:
-                st.warning("污泥老化：建议减少排泥、适当提高污泥负荷、检查进水营养比")
-            if res['ssl'] >= 150:
-                st.warning("跑泥风险：建议提高污泥回流比、降低进水量、增加排泥频次")
-            st.info("好氧池末端维持1.0~2.0mg/L DO，可有效防止二沉池内反硝化导致的污泥上浮")
+            st.subheader("🧾 综合建议（按风险优先级）")
+            if not rep["overall"]:
+                st.success("✅ 三个维度全部达标，系统整体健康，无需立即干预。")
+            else:
+                _sec_name = {"hydro": "水力", "bio": "生化", "settler": "二沉池"}
+                for sec, title, det in rep["overall"]:
+                    st.markdown(f"- **[{_sec_name.get(sec, sec)}]** {det}")
+
+
     # ================= 页面5：浸没式超滤工况 =================
     elif page == "💠 浸没式超滤工况":
         st.header("💠 浸没式超滤实时工况监控")
@@ -2428,21 +2356,18 @@ if st is not None:
 
         # ---------- ① 现场信息（膜系统配置，用于 CEB 预测与校核） ----------
         with st.expander("① 现场信息录入（膜系统配置，用于 CEB 预测与校核）", expanded=True):
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3 = st.columns(3)
             with c1:
-                Q_uf = num_input("UF 设计处理水量 (m³/d)", value=bp['Q_design'], min_value=0.0, key="uf_Q")
-                area_per_module = num_input("单支膜组件面积 (m²)", value=18.0, min_value=0.0, key="uf_area")
-            with c2:
-                modules_per_rack = num_input("单膜箱/膜架组件数", value=42, min_value=1, key="uf_mod")
-                rack_count = num_input("膜箱/膜架数量", value=40, min_value=1, key="uf_rack")
-            with c3:
-                recovery = num_input("设计回收率 (%)", value=96.0, min_value=50.0, max_value=100.0, key="uf_rec")
                 tmp_alarm = num_input("TMP 报警限值 (kPa)", value=35.0, min_value=10.0, key="uf_alarm")
-            with c4:
+            with c2:
                 ceb_thr = num_input("CEB 反洗触发 TMP (kPa)", value=15.0, min_value=10.0, key="uf_ceb")
+            with c3:
                 run_days = num_input("已连续运行天数", value=42, min_value=0, key="uf_days")
-            area_installed = area_per_module * modules_per_rack * rack_count
-            st.caption(f"已安装膜面积 ≈ {area_installed:.0f} m²（{modules_per_rack:.0f}×{rack_count:.0f} 支组件）；"
+            # 膜组件配置与水量/回收率统一从「基础参数」读取，此处仅做实时引用
+            area_installed = bp['area_per_module'] * bp['modules_per_rack'] * bp['rack_count']
+            Q_uf = bp['Q_design']
+            recovery = 96.0  # 设计回收率（行业默认值；如需调整可在「基础参数」中扩展）
+            st.caption(f"已安装膜面积 ≈ {area_installed:.0f} m²（{bp['modules_per_rack']:.0f}×{bp['rack_count']:.0f} 支组件，来自基础参数）；"
                        f"设计产水量 ≈ {Q_uf*recovery/100:.0f} m³/d")
 
         # ---------- 模拟状态初始化 ----------
@@ -2696,7 +2621,7 @@ if st is not None:
                         bio = st.session_state.bio_result
                         st.success(f"已加载：{bio['phos_agent_name']} {bio['phos_daily']:.3f}吨/天，{bio['carbon_agent_name']} {bio['carbon_daily']:.3f}吨/天")
                     else:
-                        st.warning("请先在「生化核心计算」页完成计算")
+                        st.warning("请先在「AI 工艺体检中心」页完成计算")
 
             if st.button("计算药剂总成本", type="primary", key="cost_btn_med"):
                 # 优先读生化结果，没有用默认
@@ -2756,7 +2681,7 @@ if st is not None:
                        "仅用于说明「若改用最优药剂组合，预计可较当前选型节省多少」，不改变上方按实际选型计算的成本。")
             bio_opt = get_compute_result("bio_result")
             if not bio_opt:
-                st.warning("⚠️ 请先在「🧪 生化核心计算」页完成计算，以读取碳源缺口与除磷需求。")
+                st.warning("⚠️ 请先在「🏭 AI 工艺体检中心」完成体检，以读取碳源缺口与除磷需求。")
             else:
                 if st.button("🤖 查看 AI 智能优化方案可节省金额", type="primary", key="cost_opt_btn"):
                     # 结果持久化到 session_state，避免被电耗 tab 自动刷新触发的整页 rerun 冲掉
@@ -2822,7 +2747,7 @@ if st is not None:
                     if st.session_state.bio_result:
                         st.success(f"已加载：每日干污泥 {st.session_state.bio_result['sludge_dry_daily']:.2f} kg")
                     else:
-                        st.warning("请先在「生化核心计算」页完成计算")
+                        st.warning("请先在「AI 工艺体检中心」页完成计算")
 
             if st.button("计算污泥处置成本", type="primary", key="cost_btn_sludge"):
                 dry_daily = st.session_state.bio_result.get('sludge_dry_daily', 700)  # kg/d
