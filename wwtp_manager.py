@@ -833,6 +833,128 @@ def _ai_health_check(state):
     return report
 
 
+# ============================================================
+# AI 控制面板 —— 全厂 6 设备智能控制演示（纯函数，可单测）
+# ============================================================
+def _ctrl_reason(k, prev_eff, eff):
+    """AI 调参事件原因文案（纯函数）。"""
+    if k == "fan_aero":
+        return "进水氨氮负荷变化，按 DO 设定调节曝气"
+    if k == "pump_r1":
+        return f"出水 TN {prev_eff.get('tn', 0):.1f}→{eff.get('tn', 0):.1f} mg/L，调内回流提脱氮"
+    if k == "pump_c":
+        return "进水 C/N 偏低，补充碳源强化反硝化"
+    if k == "pump_p":
+        return f"出水 TP {prev_eff.get('tp', 0):.2f} mg/L 偏高，加大除磷投加"
+    if k == "fan_mem":
+        return "膜污染上升，加强膜面擦洗"
+    return "运行工况变化，自动调整"
+
+
+def _ai_control_step(state):
+    """一帧控制仿真（原地修改 state，纯函数不依赖 streamlit）。
+    state 入参：t / nh3_in / cod_in / tn_in / tp_in / mode_ai / manual(6 开度) /
+                ops(上一帧AI开度) / eff(上一帧出水) / save_kwh / save_kg / events / hist
+    写回：ops / eff(含qualify) / power / base_power / chem_ai / chem_base /
+          save_kwh / save_kg / events(追加) / hist(追加)
+    """
+    t = state.get("t", 0)
+    nh3_in = float(state.get("nh3_in", 28))
+    cod_in = float(state.get("cod_in", 350))
+    tn_in = float(state.get("tn_in", 40))
+    tp_in = float(state.get("tp_in", 5))
+    mode_ai = state.get("mode_ai", True)
+    manual = state.get("manual", {})
+    prev_eff = state.get("eff", {"nh3": 1.0, "tn": 8.0, "tp": 0.3, "cod": 40})
+
+    def _clip(v, lo, hi):
+        return max(lo, min(hi, v))
+
+    # ---------- 1. 计算 6 设备开度（AI 规则 + 滞回 / 手动） ----------
+    prev_ops = state.get("ops", {})
+    prev_eff = state.get("eff", {"nh3": 1.0, "tn": 8.0, "tp": 0.3, "cod": 40})
+    if mode_ai:
+        do_t = _clip(1.3 + 0.024 * nh3_in, 1.3, 2.5)
+        cn_ratio = cod_in / max(tn_in, 1e-6)
+        # 滞回：避免临界值抖动（升阈值高于降阈值）
+        _c_p = prev_ops.get("pump_c", 20)
+        pump_c_op = (100 if cn_ratio < 3.9 else 20) if _c_p < 100 \
+            else (100 if cn_ratio < 4.1 else 20)
+        # 除磷泵：增量式积分控制（TP 目标 0.08~0.20，缓慢调节，杜绝开关振荡）
+        _p_p = prev_ops.get("pump_p", 50)
+        _tp_now = prev_eff.get("tp", 0.3)
+        if _tp_now > 0.20:
+            pump_p_op = int(_clip(_p_p + 15, 20, 100))
+        elif _tp_now < 0.08:
+            pump_p_op = int(_clip(_p_p - 15, 20, 100))
+        else:
+            pump_p_op = int(_p_p)
+        op = {
+            "fan_aero": int(_clip(do_t / 2.5 * 100, 40, 100)),               # 生化风机：DO 设定驱动
+            "fan_mem": 65,                                                    # 膜池风机：膜面擦洗（简化恒定）
+            "pump_r": 70,                                                     # 外回流：MLSS 控制（简化恒定）
+            "pump_r1": int(_clip(55 + (15 - prev_eff.get("tn", 8)) * 3, 55, 100)),  # 内回流：出水 TN 反馈
+            "pump_c": pump_c_op,                                             # 碳源泵：C/N 阈值 + 滞回
+            "pump_p": pump_p_op,                                             # 除磷泵：TP 反馈 + 增量调节
+        }
+    else:
+        op = {k: int(_clip(manual.get(k, 80), 0, 100))
+              for k in ("fan_aero", "fan_mem", "pump_r", "pump_r1", "pump_c", "pump_p")}
+
+    # ---------- 2. 闭环响应（一阶模型：开度 → 去除率 → 出水 → 达标率） ----------
+    n = float(np.random.normal(0, 0.2))
+    eff = {
+        # 硝化去除率随曝气开度 97%~99%（AI 满开时贴近 0.45 mg/L）
+        "nh3": _clip(nh3_in * (1 - (0.96 + 0.03 * op["fan_aero"] / 100)) + n * 0.12, 0.15, 15),
+        # TN 去除率随内回流开度 60%~92%，碳源补充再降
+        "tn": _clip(tn_in * (1 - (0.60 + 0.32 * op["pump_r1"] / 100)) + (0.6 - 0.003 * op["pump_c"]) * 0.5 + n * 0.3, 1.0, 30),
+        # TP 去除率随除磷泵开度 95%~98%（满开时 TP 围绕 0.10~0.15）
+        "tp": _clip(tp_in * (1 - (0.95 + 0.03 * op["pump_p"] / 100)) + n * 0.06, 0.02, 6),
+        # COD 去除率随曝气开度 90%~96%
+        "cod": _clip(cod_in * (1 - (0.90 + 0.06 * op["fan_aero"] / 100)) + n * 2, 10, 90),
+    }
+    std = {"nh3": 1.5, "tn": 15.0, "tp": 0.3, "cod": 30.0}
+    eff["qualify"] = sum(1 for k in std if eff[k] <= std[k]) / len(std) * 100
+
+    # ---------- 3. 功率 / 药量（AI vs 传统基准） ----------
+    def _power(o):
+        return (220 * (o["fan_aero"] / 100) ** 3 + 55 * (o["fan_mem"] / 100) ** 3
+                + 30 * (o["pump_r"] / 100) ** 1.5 + 45 * (o["pump_r1"] / 100) ** 1.5)
+    base_op = {"fan_aero": 100, "fan_mem": 80, "pump_r": 80, "pump_r1": 80, "pump_c": 60, "pump_p": 60}
+    p_ai = _power(op)
+    p_base = _power(base_op)
+    chem_ai = op["pump_c"] / 100 * 2.0 + op["pump_p"] / 100 * 1.5      # kg/h
+    chem_base = base_op["pump_c"] / 100 * 2.0 + base_op["pump_p"] / 100 * 1.5
+    dt_h = 0.5  # 每帧 = 0.5 h 虚拟时间（演示）
+    save_kwh = float(state.get("save_kwh", 0)) + max(0, p_base - p_ai) * dt_h
+    save_kg = float(state.get("save_kg", 0)) + max(0, chem_base - chem_ai) * dt_h
+
+    # ---------- 4. 事件日志（AI 模式：开度变化 ≥10% 记录） ----------
+    events = list(state.get("events", []))
+    if mode_ai:
+        prev_ops = state.get("ops", {})
+        names = {"fan_aero": "生化风机", "fan_mem": "膜池风机", "pump_r": "外回流泵",
+                 "pump_r1": "内回流泵", "pump_c": "碳源加药泵", "pump_p": "除磷剂加药泵"}
+        for k in op:
+            if k in prev_ops and abs(op[k] - prev_ops[k]) >= 10:
+                events.append({"t": t, "dev": names[k],
+                               "act": f"{prev_ops[k]}% → {op[k]}%",
+                               "why": _ctrl_reason(k, prev_eff, eff)})
+    if len(events) > 30:
+        events = events[-30:]
+
+    # ---------- 5. 历史趋势（最近 40 帧） ----------
+    hist = list(state.get("hist", []))
+    hist.append({"t": t, "TN": eff["tn"], "TP": eff["tp"], "NH3": eff["nh3"]})
+    if len(hist) > 40:
+        hist = hist[-40:]
+
+    state.update({"ops": op, "eff": eff, "power": p_ai, "base_power": p_base,
+                  "chem_ai": chem_ai, "chem_base": chem_base, "save_kwh": save_kwh,
+                  "save_kg": save_kg, "events": events, "hist": hist})
+    return state
+
+
 def mechanism_advice(var, bio=None):
     """根据超标变量给出机理联动处置建议（纯函数，bio 为生化计算结果 dict）。"""
     v = (var or "")
@@ -2095,6 +2217,7 @@ if st is not None:
                 "📝 基础参数设置",
                 "🏭 AI 工艺体检中心",
                 "💠 浸没式超滤工况",
+                "🎛️ AI 控制面板",
                 "💰 成本经济核算",
                 "🔮 AI 预测预警",
                 "💬 AI 工艺助手",
@@ -2536,6 +2659,100 @@ if st is not None:
             for piece in ai_assistant_stream(q, ctx, kb_dir=None):
                 text += piece
                 out.markdown(text)
+
+
+    # ================= 页面：AI 控制面板（演示） =================
+    elif page == "🎛️ AI 控制面板":
+        st.header("🎛️ AI 控制面板（演示）")
+        st.caption("AI 依据实时工况自动调节全厂关键设备（曝气 / 回流 / 加药），在稳定达标前提下节能降耗；"
+                   "支持「AI 自动 / 在线手动」双模式。* 演示模式：执行机构为虚拟仿真，不连接真实设备 *")
+
+        # 控制状态初始化
+        if "acp_state" not in st.session_state:
+            st.session_state.acp_state = {"t": 0, "ops": {}, "eff": {}, "manual": {},
+                                          "save_kwh": 0.0, "save_kg": 0.0,
+                                          "events": [], "hist": []}
+        if st.button("↺ 重置演示", key="acp_reset"):
+            st.session_state.acp_state = {"t": 0, "ops": {}, "eff": {}, "manual": {},
+                                          "save_kwh": 0.0, "save_kg": 0.0,
+                                          "events": [], "hist": []}
+            st.rerun()
+
+        # 控制模式（fragment 外，状态持久）
+        mode = st.radio("控制模式", ["🤖 AI 自动", "🎚️ 在线手动"], horizontal=True,
+                        key="acp_mode", index=0)
+
+        # 手动模式滑杆（fragment 外）
+        manual = {}
+        if mode == "🎚️ 在线手动":
+            st.markdown("**手动设定设备开度（%）**")
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                manual["fan_aero"] = st.slider("生化风机", 0, 100, 80, key="acp_man_aero")
+                manual["fan_mem"] = st.slider("膜池风机", 0, 100, 80, key="acp_man_mem")
+            with m2:
+                manual["pump_r"] = st.slider("外回流泵", 0, 100, 80, key="acp_man_r")
+                manual["pump_r1"] = st.slider("内回流泵", 0, 100, 80, key="acp_man_r1")
+            with m3:
+                manual["pump_c"] = st.slider("碳源加药泵", 0, 100, 30, key="acp_man_c")
+                manual["pump_p"] = st.slider("除磷剂加药泵", 0, 100, 30, key="acp_man_p")
+            st.session_state.acp_state["manual"] = manual
+
+        # ---------- 实时控制区（fragment 每 2s 自动推进一帧） ----------
+        @st.fragment(run_every=2)
+        def _acp_live():
+            if page != "🎛️ AI 控制面板":
+                return
+            st_ = st.session_state.acp_state
+            st_["t"] = st_.get("t", 0) + 1
+            t = st_["t"]
+            # 模拟进水负荷（正弦日周期 + 噪声）
+            st_["nh3_in"] = float(np.clip(28 + 8 * np.sin(t / 6) + np.random.normal(0, 1.5), 15, 45))
+            st_["cod_in"] = float(np.clip(350 + 70 * np.sin(t / 9 + 1) + np.random.normal(0, 15), 220, 520))
+            st_["tn_in"] = st_["nh3_in"] * 1.4
+            st_["tp_in"] = 5.0
+            st_["mode_ai"] = (mode == "🤖 AI 自动")
+            _ai_control_step(st_)
+
+            ops = st_.get("ops", {})
+            eff = st_.get("eff", {})
+
+            st.markdown("---")
+            # ① 设备控制状态
+            st.subheader("① 设备控制状态")
+            dev_cfg = [
+                ("fan_aero", "生化风机", "曝气 DO 控制"), ("fan_mem", "膜池风机", "膜面擦洗"),
+                ("pump_r", "外回流泵", "污泥回流"), ("pump_r1", "内回流泵", "脱氮回流"),
+                ("pump_c", "碳源加药泵", "反硝化碳源"), ("pump_p", "除磷剂加药泵", "化学除磷"),
+            ]
+            for i in range(0, 6, 3):
+                row = st.columns(3)
+                for j, (k, name, desc) in enumerate(dev_cfg[i:i + 3]):
+                    with row[j]:
+                        op = ops.get(k, 0)
+                        st.metric(name, f"{op}%", help=f"{desc}；AI 模式自动计算，手动模式可拖滑杆")
+
+            # ② 出水水质（闭环响应）
+            st.markdown("---")
+            st.subheader("② 出水水质（闭环响应）")
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("出水 NH₃-N", f"{eff.get('nh3', 0):.2f}", help="限值 1.5 mg/L")
+            q2.metric("出水 TN", f"{eff.get('tn', 0):.2f}", help="限值 15 mg/L")
+            q3.metric("出水 TP", f"{eff.get('tp', 0):.2f}", help="限值 0.3 mg/L")
+            q4.metric("出水 COD", f"{eff.get('cod', 0):.0f}", help="限值 30 mg/L")
+
+            # ③ 事件日志
+            st.markdown("---")
+            st.subheader("③ AI 调参事件日志")
+            evs = st_.get("events", [])[-8:]
+            if evs:
+                for e in reversed(evs):
+                    st.markdown(f"- **帧 {e['t']}** · {e['dev']}：{e['act']} —— {e['why']}")
+            else:
+                st.caption("（AI 自动模式下，设备开度变化 ≥10% 时自动记录事件；可切「在线手动」拖滑杆对比）")
+
+        _acp_live()
+
 
     # ================= 页面6：成本经济核算 =================
     elif page == "💰 成本经济核算":
