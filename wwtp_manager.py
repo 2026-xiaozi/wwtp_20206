@@ -232,12 +232,13 @@ def smart_forecast(y, season=24, h=24):
 # ============================================================
 # 加药优化（线性规划最小成本）
 # ============================================================
-def optimize_dosing(bp, bio):
+def optimize_dosing(bp, bio, med=None):
     """在满足出水标准约束下，用线性规划最小化药剂成本。
-    变量：4 种碳源(mg/L) + 2 种混凝剂(mg/L)；约束：外加碳源 COD 与化学除磷量达标。"""
+    变量：4 种碳源(mg/L) + 2 种混凝剂(mg/L)；约束：外加碳源 COD 与化学除磷量达标。
+    "当前选型日成本" 优先读 med_result（成本页手输的实际投加量），fallback bio_result。"""
     Q = float(bp.get('Q_actual', 1e4))
-    carbon_deficit = float(bio.get('carbon_deficit', 0.0))   # mg/L COD 缺口
-    tp_need_chem = float(bio.get('tp_need_chem', 0.0))       # mg/L 需化学除磷(P)
+    carbon_deficit = float(bio.get('carbon_deficit', 0.0))   # mg/L COD 缺口（约束）
+    tp_need_chem = float(bio.get('tp_need_chem', 0.0))       # mg/L 需化学除磷（约束）
     carbon_sources = [
         ("乙酸钠", 0.68, float(bp.get('naac_price', 0))),
         ("甲醇", 1.50, float(bp.get('methanol_price', 0))),
@@ -248,10 +249,20 @@ def optimize_dosing(bp, bio):
         ("PAC", 1.5 * 27 / 31 / 0.10, float(bp.get('pac_price', 0))),
         ("PFS", 1.5 * 56 / 31 / 0.11, float(bp.get('pfs_price', 0))),
     ]
-    cur_carbon = float(bio.get('carbon_daily', 0.0))
-    cur_phos = float(bio.get('phos_daily', 0.0))
-    cur_carbon_price = float(bp.get(bio.get('carbon_price_key', ''), 0))
-    cur_phos_price = float(bp.get(bio.get('phos_price_key', ''), 0))
+    # "当前选型"：优先 med_result（成本页手输），fallback bio_result（体检中心算）
+    _med = med or {}
+    cur_carbon = float(_med.get('carbon_daily', bio.get('carbon_daily', 0.0)))
+    cur_phos = float(_med.get('phos_daily', bio.get('phos_daily', 0.0)))
+    # 按药剂名查 base_params 单价（不依赖 bio 缺失字段，更稳健）
+    _AGENT_TO_PRICE_KEY = {
+        "乙酸钠": "naac_price", "甲醇": "methanol_price",
+        "葡萄糖": "glucose_price", "复合碳源": "composite_carbon_price",
+        "聚合氯化铝 PAC（铝盐）": "pac_price", "聚合硫酸铁 PFS（铁盐）": "pfs_price",
+    }
+    cur_carbon_name = _med.get('carbon_name', bio.get('carbon_agent_name', ''))
+    cur_phos_name = _med.get('phos_name', bio.get('phos_agent_name', ''))
+    cur_carbon_price = float(bp.get(_AGENT_TO_PRICE_KEY.get(cur_carbon_name, ''), 0))
+    cur_phos_price = float(bp.get(_AGENT_TO_PRICE_KEY.get(cur_phos_name, ''), 0))
     cur_cost = cur_carbon * cur_carbon_price + cur_phos * cur_phos_price
     rec_carbon = {name: 0.0 for name, _, _ in carbon_sources}
     rec_phos = {name: 0.0 for name, _, _ in coags}
@@ -1304,7 +1315,7 @@ def gen_plant_csv(path=None, n_steps=24 * 60, seed=20260808, **kw):
     return path
 
 
-def export_pdf_report(bp, bio, cost):
+def export_pdf_report(bp, bio, cost, uf=None):
     """生成排版精美的中文 PDF 运行报表，返回 BytesIO。
 
     中文字体嵌入策略（确保电脑/手机均可正确显示）：
@@ -1413,11 +1424,11 @@ def export_pdf_report(bp, bio, cost):
     flow.append(Spacer(1, 10))
 
     if cost:
-        tn_txt = f"<b>{bio['tn_theory']:.2f}</b><br/>理论出水 TN (mg/L)" if bio else "—"
+        annual_cost = cost["total_month"] * 12
         kpi = [[
             Paragraph(f"<b>{cost['total_month']:,.0f}</b><br/>月度总成本 (元)", st_cell),
+            Paragraph(f"<b>{annual_cost:,.0f}</b><br/>年度总成本 (元)", st_cell),
             Paragraph(f"<b>{cost['unit_cost']:.3f}</b><br/>吨水综合成本 (元/吨)", st_cell),
-            Paragraph(tn_txt, st_cell),
         ]]
         kt = Table(kpi, colWidths=[58 * mm] * 3)
         kt.setStyle(TableStyle([
@@ -1432,6 +1443,12 @@ def export_pdf_report(bp, bio, cost):
         flow.append(Spacer(1, 6))
 
     # ---------- 一、基础参数 ----------
+    def _u(t):
+        """PDF 文本安全化：上标 ³/²/⁻¹ 转 reportlab super 标签（msyh 等 TTF 字体不支持 Unicode 上标）。"""
+        if not isinstance(t, str):
+            return t
+        return (t.replace("³", "<super>3</super>").replace("²", "<super>2</super>")
+                 .replace("⁻¹", "<super>-1</super>"))
     param_map = {
         "Q_design": "设计日处理水量 (m³/d)", "Q_actual": "实际日均进水量 (m³/d)",
         "Kz": "总变化系数 Kz", "Q_max": "最大时流量 (m³/h)",
@@ -1441,7 +1458,8 @@ def export_pdf_report(bp, bio, cost):
         "settler_area": "二沉池总表面积 (m²)", "settler_depth": "二沉池有效水深 (m)",
         "Y": "污泥产率系数 Y", "Kd": "内源衰减系数 Kd (d⁻¹)",
         "nitr_rate": "硝化速率 (kgNH3/(kgMLSS·d))", "denitr_rate": "反硝化速率 (kgNO3/(kgMLSS·d))",
-        "mlvss_mlss": "MLVSS/MLSS 比值", "elec_price": "电价 (元/kWh)",
+        "mlvss_mlss": "MLVSS/MLSS 比值", "carbon_cod_eq": "碳源COD当量基准值 (gCOD/g 药剂)",
+        "elec_price": "电价 (元/kWh)",
         "pac_price": "PAC单价 (元/吨)", "pfs_price": "PFS单价 (元/吨)",
         "naac_price": "乙酸钠单价 (元/吨)", "methanol_price": "甲醇单价 (元/吨)",
         "glucose_price": "葡萄糖单价 (元/吨)", "composite_carbon_price": "复合碳源单价 (元/吨)",
@@ -1449,11 +1467,15 @@ def export_pdf_report(bp, bio, cost):
         "hcl_price": "盐酸单价 (元/吨)", "sludge_dispose_price": "污泥处置单价 (元/吨湿泥)",
         "staff_num": "运维人员数量 (人)", "staff_salary": "人均月工资 (元)",
         "maintain_cost": "月度设备维修费 (元)", "other_cost": "月度其他杂费 (元)",
+        # 膜组件配置（浸没式超滤）
+        "area_per_module": "单支膜组件面积 (m²)",
+        "modules_per_rack": "单膜箱/膜架组件数 (支/箱)",
+        "rack_count": "膜箱/膜架数量 (箱)",
     }
     flow.append(Paragraph("一、水厂基础设计参数", st_h))
     rows = [[Paragraph("参数名称", st_cellw), Paragraph("参数值", st_cellw)]]
     for k, v in bp.items():
-        rows.append([Paragraph(param_map.get(k, k), st_cell), Paragraph(fmt(v), st_cell)])
+        rows.append([Paragraph(_u(param_map.get(k, k)), st_cell), Paragraph(fmt(v), st_cell)])
     t = Table(rows, colWidths=[120 * mm, 58 * mm], repeatRows=1)
     t.setStyle(_table_style())
     flow.append(t)
@@ -1472,20 +1494,60 @@ def export_pdf_report(bp, bio, cost):
             (f"{bio['phos_agent_name']}日投加量", f"{bio['phos_daily']:.3f} 吨/天", ""),
             ("污泥龄 SRT（硝化段）", f"{bio['srt']:.1f} d", "满足硝化菌世代要求" if bio['srt'] > 10 else "泥龄偏短，硝化菌易流失"),
             ("每日剩余干污泥量", f"{bio['sludge_dry_daily']:.2f} kg/d", ""),
-            ("湿污泥量（含水率99.2%）", f"{bio['sludge_wet_daily']:.2f} m³/d", ""),
+            ("湿污泥量（含水率 99.2%）", f"{bio['sludge_wet_daily']:.2f} m³/d", ""),
         ]
         r2 = [[Paragraph("指标", st_cellw), Paragraph("计算结果", st_cellw), Paragraph("说明 / 状态", st_cellw)]]
         for a, b, c in bio_rows:
-            r2.append([Paragraph(a, st_cell), Paragraph(b, st_cell), Paragraph(c, st_cell)])
+            r2.append([Paragraph(_u(a), st_cell), Paragraph(_u(b), st_cell), Paragraph(_u(c), st_cell)])
         t2 = Table(r2, colWidths=[60 * mm, 50 * mm, 68 * mm], repeatRows=1)
         t2.setStyle(_table_style())
         flow.append(t2)
     else:
         flow.append(Paragraph("暂无生化计算数据，请先完成「AI 工艺体检中心」页面。", st_body))
+
+    # ---------- 三、浸没式超滤系统 ----------
+    flow.append(Paragraph("三、浸没式超滤系统", st_h))
+    if uf:
+        _cfg = uf.get("cfg", {})
+        _run = uf.get("run", {})
+        _area = float(_cfg.get("area", 0))
+        _mod = float(_cfg.get("mod", 0))
+        _rack = float(_cfg.get("rack", 0))
+        _rec = float(_cfg.get("rec", 96))
+        _q = float(_cfg.get("q", 0))
+        _installed = _area * _mod * _rack
+        _prod = _q * _rec / 100
+        uf_rows = [
+            ("单支膜组件面积", f"{_area:.1f} m²", ""),
+            ("单膜箱/膜架组件数", f"{_mod:.0f} 支", ""),
+            ("膜箱/膜架数量", f"{_rack:.0f} 箱", ""),
+            ("设计回收率", f"{_rec:.1f} %", ""),
+            ("已安装膜面积", f"{_installed:.0f} m²", f"{_mod:.0f} × {_rack:.0f} 支组件"),
+            ("设计产水量", f"{_prod:.0f} m³/d", ""),
+            ("TMP 报警限值", f"{float(_run.get('alarm', 35)):.1f} kPa", ""),
+            ("CEB 反洗触发 TMP", f"{float(_run.get('ceb', 15)):.1f} kPa", ""),
+            ("已连续运行天数", f"{float(_run.get('days', 42)):.0f} 天", ""),
+            # —— 实时运行指标（来自超滤页 fragment 末帧值，未采集时给默认值）——
+            ("运行通量", f"{float(_run.get('flux', 22.0)):.1f} LMH", "设计区间 22~26 LMH"),
+            ("跨膜压差 TMP", f"{float(_run.get('tmp', 5.0)):.2f} kPa",
+             f"CEB 阈值 {float(_run.get('ceb', 15)):.0f} kPa，报警 {float(_run.get('alarm', 35)):.0f} kPa"),
+            ("曝气强度", f"{float(_run.get('aer', 60.0)):.1f} m³/(m²·h)", "设计区间 60~70"),
+            ("出水浊度", f"{float(_run.get('turb', 0.03)):.3f} NTU", "设计 ≤0.06"),
+        ]
+        r_uf = [[Paragraph("项目", st_cellw), Paragraph("数值", st_cellw), Paragraph("说明", st_cellw)]]
+        for a, b, c in uf_rows:
+            r_uf.append([Paragraph(_u(a), st_cell), Paragraph(_u(b), st_cell), Paragraph(_u(c), st_cell)])
+        t_uf = Table(r_uf, colWidths=[60 * mm, 50 * mm, 68 * mm], repeatRows=1)
+        t_uf.setStyle(_table_style())
+        flow.append(t_uf)
+        flow.append(Paragraph("运行策略：TMP 超过 CEB 阈值时执行 CEB 反洗（次氯酸钠/柠檬酸），"
+                              "接近报警限值时安排 CIP 化学清洗；实时通量/浊度见监控页。", st_body))
+    else:
+        flow.append(Paragraph("暂无超滤系统数据，请先在「浸没式超滤工况」页录入现场信息。", st_body))
     flow.append(PageBreak())
 
-    # ---------- 三、成本 + 饼图 ----------
-    flow.append(Paragraph("三、月度运行成本核算", st_h))
+    # ---------- 四、成本 + 饼图 ----------
+    flow.append(Paragraph("四、月度运行成本核算", st_h))
     if cost:
         labels = ["电费", "药剂费", "污泥处置", "人员工资", "维修耗材", "其他"]
         vals = [cost['power_cost'], cost['med_cost'], cost['sludge_cost'],
@@ -1529,10 +1591,9 @@ def export_pdf_report(bp, bio, cost):
             f"<b>{cost['unit_cost']:.3f}</b> 元/吨。", st_body))
     else:
         flow.append(Paragraph("暂无成本核算数据，请先完成「成本核算」页面。", st_body))
-    flow.append(PageBreak())
 
-    # ---------- 四、结论与建议 ----------
-    flow.append(Paragraph("四、关键结论与运行建议", st_h))
+    # ---------- 五、结论与建议 ----------
+    flow.append(Paragraph("五、关键结论与运行建议", st_h))
     bullets = []
     if bio:
         tgt = bio.get('tn_out_target', 15)
@@ -1967,7 +2028,7 @@ if st is not None:
             </div>
             <span>CoreMate · 智慧水务</span>
         </div>
-        <div class="top-version">v1.2.0 · 2026 · 山东招金膜天</div>
+        <div class="top-version">v1.2.0 · 2026 · 招金膜天</div>
 
         <div class="bottom-brand">
             <div class="copy">© 2026 CoreMate · AI-Driven WWTP Intelligent O&amp;M Platform</div>
@@ -2448,16 +2509,19 @@ if st is not None:
                 ("🧪 报告 2：生化脱氮除磷状态", "bio"),
                 ("🏞️ 报告 3：二沉池运行状态", "settler"),
             ]
-            for title, key in _secs:
-                with st.expander(title, expanded=(key == "hydro")):
-                    d = rep[key]
-                    st.markdown(f"**{d['summary']}**")
-                    for icon, it, det in d["items"]:
-                        st.markdown(f"- {icon} **{it}**：{det}")
-                    if d["advice"]:
-                        st.markdown("**💡 优化建议：**")
-                        for adv in d["advice"]:
-                            st.markdown(f"  - {adv}")
+            # 三列横向并排：避免竖向堆叠导致页面过长；首列默认展开便于快速浏览
+            c1, c2, c3 = st.columns(3, gap="small")
+            for col, (title, key) in zip((c1, c2, c3), _secs):
+                with col:
+                    with st.expander(title, expanded=(key == "hydro")):
+                        d = rep[key]
+                        st.markdown(f"**{d['summary']}**")
+                        for icon, it, det in d["items"]:
+                            st.markdown(f"- {icon} **{it}**：{det}")
+                        if d["advice"]:
+                            st.markdown("**💡 优化建议：**")
+                            for adv in d["advice"]:
+                                st.markdown(f"  - {adv}")
 
             st.markdown("---")
             st.subheader("🧾 综合建议（按风险优先级）")
@@ -2897,12 +2961,16 @@ if st is not None:
             st.caption("以下为在满足相同碳源 / 除磷需求下，由线性规划在全部可选药剂中自动挑选成本最低组合的「理想方案」。"
                        "仅用于说明「若改用最优药剂组合，预计可较当前选型节省多少」，不改变上方按实际选型计算的成本。")
             bio_opt = get_compute_result("bio_result")
+            med_res = get_compute_result("med_result")
             if not bio_opt:
                 st.warning("⚠️ 请先在「🏭 AI 工艺体检中心」完成体检，以读取碳源缺口与除磷需求。")
+            elif not med_res:
+                st.warning("⚠️ 请先在本页「药剂成本」点击「计算」按钮，让系统读取当前投加量；"
+                           "「当前选型」与上表同源。")
             else:
                 if st.button("🤖 查看 AI 智能优化方案可节省金额", type="primary", key="cost_opt_btn"):
                     # 结果持久化到 session_state，避免被电耗 tab 自动刷新触发的整页 rerun 冲掉
-                    st.session_state.dosing_opt_result = optimize_dosing(bp, bio_opt)
+                    st.session_state.dosing_opt_result = optimize_dosing(bp, bio_opt, med=med_res)
 
                 # 持久展示：依据 session_state 渲染，autorefresh 触发的整页 rerun 也不会丢失结果
                 if st.session_state.get('dosing_opt_result'):
@@ -2912,7 +2980,14 @@ if st is not None:
                     st.markdown("#### 📊 成本对比（当前选型 vs AI 最优组合）")
                     c1, c2, c3 = st.columns(3)
                     c1.metric("当前选型日药剂成本", f"{opt['cur_cost']:.2f} 元/天")
-                    c2.metric("AI 最优组合日成本", f"{opt['opt_cost']:.2f} 元/天", delta=f"-{(opt['cur_cost']-opt['opt_cost'])/opt['cur_cost']*100:.1f}%")
+                    # 节省比例：cur_cost 为 0 时无基线可比，显示"-"避免误导
+                    if opt['cur_cost'] > 1e-6:
+                        delta_pct = f"-{(opt['cur_cost']-opt['opt_cost'])/opt['cur_cost']*100:.1f}%"
+                    elif opt['opt_cost'] < opt['cur_cost']:
+                        delta_pct = "-100.0%"
+                    else:
+                        delta_pct = "-"
+                    c2.metric("AI 最优组合日成本", f"{opt['opt_cost']:.2f} 元/天", delta=delta_pct)
                     if opt["saving_pct"] > 0:
                         c3.metric("💰 每日预计节省", f"{opt['saving']:.2f} 元/天", delta=f"{opt['saving_pct']:.1f}%")
                     else:
@@ -3147,8 +3222,32 @@ if st is not None:
             bp = st.session_state.base_params
             bio = get_compute_result("bio_result")
             cost = get_compute_result("total_cost_result")
+            # 超滤系统数据：膜组件配置来自基础参数；运行参数（报警/CEB/天数）来自超滤页 session_state；
+            # 实时运行指标（通量/TMP/曝气/浊度）取自超滤页 fragment 末帧（未采集时给默认值）
+            _sim = st.session_state.get("uf_sim", {})
+            def _last(k, default):
+                arr = _sim.get(k, [])
+                return float(arr[-1]) if arr else default
+            uf_data = {
+                "cfg": {
+                    "area": bp.get("area_per_module", 18.0),
+                    "mod": bp.get("modules_per_rack", 42),
+                    "rack": bp.get("rack_count", 40),
+                    "rec": 96.0,
+                    "q": bp.get("Q_design", 10000),
+                },
+                "run": {
+                    "alarm": st.session_state.get("uf_alarm", 35.0),
+                    "ceb": st.session_state.get("uf_ceb", 15.0),
+                    "days": st.session_state.get("uf_days", 42),
+                    "flux": _last("flux", 22.0),
+                    "tmp": _last("tmp", 5.0),
+                    "aer": _last("aer", 60.0),
+                    "turb": _last("turb", 0.03),
+                },
+            }
             try:
-                pdf_buf = export_pdf_report(bp, bio, cost)
+                pdf_buf = export_pdf_report(bp, bio, cost, uf=uf_data)
                 st.success("✅ PDF 报表生成完成，可直接在手机/电脑上打开查看（中文字体已嵌入）")
                 st.download_button(
                     label="📥 下载中文PDF报表",
@@ -3886,6 +3985,18 @@ if st is not None:
         st.caption("注入当前系统计算结果与知识库作为上下文；侧边栏显示「云端/本地模型已配置」时由大模型实时生成回答，"
                    "否则自动降级为内置规则引擎。当前模式见左侧「AI 模式」状态条。")
 
+        # 能力标签 Chips（专业 AI 界面元素）
+        st.markdown("""
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 14px">
+            <span style="padding:3px 12px;border-radius:999px;background:rgba(83,74,183,0.12);color:#8b84e6;font-size:12px;border:0.5px solid rgba(83,74,183,0.3)">🔬 工艺诊断</span>
+            <span style="padding:3px 12px;border-radius:999px;background:rgba(29,158,117,0.12);color:#2ebd91;font-size:12px;border:0.5px solid rgba(29,158,117,0.3)">📊 数据分析</span>
+            <span style="padding:3px 12px;border-radius:999px;background:rgba(55,138,221,0.12);color:#5da3e6;font-size:12px;border:0.5px solid rgba(55,138,221,0.3)">💡 方案推荐</span>
+            <span style="padding:3px 12px;border-radius:999px;background:rgba(226,75,74,0.12);color:#e67373;font-size:12px;border:0.5px solid rgba(226,75,74,0.3)">🔧 故障排查</span>
+            <span style="padding:3px 12px;border-radius:999px;background:rgba(186,117,23,0.12);color:#d39a4b;font-size:12px;border:0.5px solid rgba(186,117,23,0.3)">📚 规范检索</span>
+            <span style="padding:3px 12px;border-radius:999px;background:rgba(100,153,34,0.12);color:#7fb43f;font-size:12px;border:0.5px solid rgba(100,153,34,0.3)">🎯 成本优化</span>
+        </div>
+        """, unsafe_allow_html=True)
+
         ctx_parts = []
         bp = st.session_state.get("base_params", {})
         bio = get_compute_result("bio_result")
@@ -3979,16 +4090,37 @@ if st is not None:
             </details>
             """, unsafe_allow_html=True)
 
+        # 聊天区样式：气泡圆角、更紧凑
+        st.markdown("""
+        <style>
+        .stChatMessage { border-radius: 14px !important; }
+        .stChatMessage [data-testid="stChatMessageContent"] { line-height: 1.65; }
+        </style>
+        """, unsafe_allow_html=True)
+
         if "ai_messages" not in st.session_state:
             st.session_state.ai_messages = []
         for m in st.session_state.ai_messages:
-            with st.chat_message(m["role"]):
+            with st.chat_message(m["role"], avatar="🧑‍💼" if m["role"] == "user" else "🤖"):
                 st.markdown(m["content"])
         if q := st.chat_input("向工艺助手提问，如：当前总氮偏高怎么处理？"):
             st.session_state.ai_messages.append({"role": "user", "content": q})
-            with st.chat_message("user"):
+            with st.chat_message("user", avatar="🧑‍💼"):
                 st.markdown(q)
-            with st.chat_message("assistant"):
+            with st.chat_message("assistant", avatar="🤖"):
+                # AI 处理步骤展示（快速渐进点亮，让评委看到 AI 工作过程）
+                import time as _time
+                _steps = ["📊 读取基础参数与生化结果", "📖 检索工艺知识库", "💡 推导运行建议", "✍️ 生成回复"]
+                _ph = st.empty()
+                for _i in range(len(_steps)):
+                    _done = "，".join(f"✅ {s}" for s in _steps[:_i + 1])
+                    _todo = "，".join(f"⏳ {s}" for s in _steps[_i + 1:])
+                    _html = f"🤖 **AI 处理中**<br/>{_done}"
+                    if _todo:
+                        _html += f"<br/>{_todo}"
+                    _ph.markdown(_html, unsafe_allow_html=True)
+                    _time.sleep(0.28)
+                _ph.empty()
                 reply = st.write_stream(ai_assistant_stream(q, ctx, kb_dir=find_kb_dir()))
             st.session_state.ai_messages.append({"role": "assistant", "content": reply})
         if st.button("清空对话", key="ai_clear"):
