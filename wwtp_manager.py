@@ -888,16 +888,17 @@ def _ai_control_step(state):
         do_t = _clip(1.3 + 0.024 * nh3_in, 1.3, 2.5)
         cn_ratio = cod_in / max(tn_in, 1e-6)
         # 滞回：避免临界值抖动（升阈值高于降阈值）
-        _c_p = prev_ops.get("pump_c", 20)
-        pump_c_op = (100 if cn_ratio < 3.9 else 20) if _c_p < 100 \
-            else (100 if cn_ratio < 4.1 else 20)
-        # 除磷泵：增量式积分控制（TP 目标 0.08~0.20，缓慢调节，杜绝开关振荡）
-        _p_p = prev_ops.get("pump_p", 50)
+        _c_p = prev_ops.get("pump_c", 0)
+        # 碳源泵：C/N≥4 停泵（0%），C/N<4 加药档 56%（28Hz 稳态，按需低剂量投加）
+        pump_c_op = (56 if cn_ratio < 3.9 else 0) if _c_p < 56 \
+            else (56 if cn_ratio < 4.1 else 0)
+        # 除磷泵：增量式积分控制（TP 目标 ~0.13，稳态 46% ≈ 23Hz；±5 步进防抖）
+        _p_p = prev_ops.get("pump_p", 46)
         _tp_now = prev_eff.get("tp", 0.3)
-        if _tp_now > 0.20:
-            pump_p_op = int(_clip(_p_p + 15, 20, 100))
-        elif _tp_now < 0.08:
-            pump_p_op = int(_clip(_p_p - 15, 20, 100))
+        if _tp_now > 0.16:
+            pump_p_op = int(_clip(_p_p + 5, 20, 100))
+        elif _tp_now < 0.11:
+            pump_p_op = int(_clip(_p_p - 5, 20, 100))
         else:
             pump_p_op = int(_p_p)
         op = {
@@ -909,7 +910,8 @@ def _ai_control_step(state):
             "pump_p": pump_p_op,                                             # 除磷泵：TP 反馈 + 增量调节
         }
     else:
-        op = {k: int(_clip(manual.get(k, 80), 0, 100))
+        # 手动模式：manual 字典存频率 Hz（0~50），转开度 % (×2) 用于内部 P∝n³ 功率计算
+        op = {k: int(_clip(float(manual.get(k, 40.0)) * 2.0, 0, 100))
               for k in ("fan_aero", "fan_mem", "pump_r", "pump_r1", "pump_c", "pump_p")}
 
     # ---------- 2. 闭环响应（一阶模型：开度 → 去除率 → 出水 → 达标率） ----------
@@ -919,8 +921,8 @@ def _ai_control_step(state):
         "nh3": _clip(nh3_in * (1 - (0.96 + 0.03 * op["fan_aero"] / 100)) + n * 0.12, 0.15, 15),
         # TN 去除率随内回流开度 60%~92%，碳源补充再降
         "tn": _clip(tn_in * (1 - (0.60 + 0.32 * op["pump_r1"] / 100)) + (0.6 - 0.003 * op["pump_c"]) * 0.5 + n * 0.3, 1.0, 30),
-        # TP 去除率随除磷泵开度 95%~98%（满开时 TP 围绕 0.10~0.15）
-        "tp": _clip(tp_in * (1 - (0.95 + 0.03 * op["pump_p"] / 100)) + n * 0.06, 0.02, 6),
+        # TP 去除率随除磷泵开度 96%~99%（46% 稳态时 TP≈0.13）
+        "tp": _clip(tp_in * (1 - (0.96 + 0.03 * op["pump_p"] / 100)) + n * 0.06, 0.02, 6),
         # COD 去除率随曝气开度 90%~96%
         "cod": _clip(cod_in * (1 - (0.90 + 0.06 * op["fan_aero"] / 100)) + n * 2, 10, 90),
     }
@@ -947,7 +949,7 @@ def _ai_control_step(state):
         names = {"fan_aero": "生化风机", "fan_mem": "膜池风机", "pump_r": "外回流泵",
                  "pump_r1": "内回流泵", "pump_c": "碳源加药泵", "pump_p": "除磷剂加药泵"}
         for k in op:
-            if k in prev_ops and abs(op[k] - prev_ops[k]) >= 10:
+            if k in prev_ops and abs(op[k] - prev_ops[k]) >= 20:
                 events.append({"t": t, "dev": names[k],
                                "act": f"{prev_ops[k]}% → {op[k]}%",
                                "why": _ctrl_reason(k, prev_eff, eff)})
@@ -2746,20 +2748,20 @@ if st is not None:
         mode = st.radio("控制模式", ["🤖 AI 自动", "🎚️ 在线手动"], horizontal=True,
                         key="acp_mode", index=0)
 
-        # 手动模式滑杆（fragment 外）
+        # 手动模式滑杆（fragment 外）—— 变频频率 Hz（0~50，工频 50Hz）
         manual = {}
         if mode == "🎚️ 在线手动":
-            st.markdown("**手动设定设备开度（%）**")
+            st.markdown("**手动设定设备频率（Hz）**")
             m1, m2, m3 = st.columns(3)
             with m1:
-                manual["fan_aero"] = st.slider("生化风机", 0, 100, 80, key="acp_man_aero")
-                manual["fan_mem"] = st.slider("膜池风机", 0, 100, 80, key="acp_man_mem")
+                manual["fan_aero"] = st.slider("生化风机", 0.0, 50.0, 40.0, step=0.5, key="acp_man_aero")
+                manual["fan_mem"] = st.slider("膜池风机", 0.0, 50.0, 40.0, step=0.5, key="acp_man_mem")
             with m2:
-                manual["pump_r"] = st.slider("外回流泵", 0, 100, 80, key="acp_man_r")
-                manual["pump_r1"] = st.slider("内回流泵", 0, 100, 80, key="acp_man_r1")
+                manual["pump_r"] = st.slider("外回流泵", 0.0, 50.0, 40.0, step=0.5, key="acp_man_r")
+                manual["pump_r1"] = st.slider("内回流泵", 0.0, 50.0, 40.0, step=0.5, key="acp_man_r1")
             with m3:
-                manual["pump_c"] = st.slider("碳源加药泵", 0, 100, 30, key="acp_man_c")
-                manual["pump_p"] = st.slider("除磷剂加药泵", 0, 100, 30, key="acp_man_p")
+                manual["pump_c"] = st.slider("碳源加药泵", 0.0, 50.0, 35.0, step=0.5, key="acp_man_c")
+                manual["pump_p"] = st.slider("除磷剂加药泵", 0.0, 50.0, 35.0, step=0.5, key="acp_man_p")
             st.session_state.acp_state["manual"] = manual
 
         # ---------- 实时控制区（fragment 每 2s 自动推进一帧） ----------
@@ -2794,7 +2796,8 @@ if st is not None:
                 for j, (k, name, desc) in enumerate(dev_cfg[i:i + 3]):
                     with row[j]:
                         op = ops.get(k, 0)
-                        st.metric(name, f"{op}%", help=f"{desc}；AI 模式自动计算，手动模式可拖滑杆")
+                        st.metric(name, f"{op * 0.5:.1f} Hz",
+                                  help=f"{desc}；变频 0~50Hz（工频），开度 = {op}%；AI 模式自动计算，手动模式可拖滑杆")
 
             # ② 出水水质（闭环响应）
             st.markdown("---")
