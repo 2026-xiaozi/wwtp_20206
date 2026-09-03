@@ -310,9 +310,17 @@ def diagnose_process(bp, bio):
     issues = []
     tn_target = bio.get('tn_out_target', 15)
     if bio.get('tn_theory', 0) > tn_target:
+        _min_r1 = float(bio.get('min_R1', 0) or 0)
+        if _min_r1 >= TN_R1_INFEASIBLE:
+            # 目标低于不可反硝化本底：加大 R1 无解，需改变工艺路线而非调参
+            _r1_cause = ("目标 TN 低于不可反硝化本底，加大内回流无解",
+                         "增设后置反硝化深床滤池，或以外加碳源强化二级缺氧池", 0.9)
+        else:
+            _r1_cause = ("内回流比 R1 不足，硝态氮回流量不够",
+                         f"加大内回流 R1 至 ≥ {max(_min_r1, 100):.0f}%", 0.9)
         issues.append((
             f"总氮 TN 超标风险（理论出水 {bio['tn_theory']:.2f} > 目标 {tn_target:.1f} mg/L）",
-            [("内回流比 R1 不足，硝态氮回流量不够", f"加大内回流 R1 至 ≥ {max(bio.get('min_R1', 0), 100):.0f}%", 0.9),
+            [_r1_cause,
              ("外加碳源不足 / 碳氮比偏低", f"C/N={bio.get('cn_ratio', 0):.1f}<4，按反硝化缺口补充碳源", 0.7),
              ("缺氧区 DO 偏高，消耗外加碳源", "控制第一缺氧池 DO<0.5 mg/L", 0.5)]
         ))
@@ -483,6 +491,12 @@ def _rule_reply(q, ctx):
             "国标": 2, "指南": 1, "设计规程": 2,
         }, "【知识检索】当前未配置外部知识库，已使用内置工艺规则作答；"
            "配置 Knowledge_Base 目录后可启用 RAG 检索增强。"),
+        ("微生物镜检", {
+            "镜检": 3, "镜检图": 3, "微生物": 2, "显微镜": 2, "指示生物": 2,
+            "钟虫": 2, "轮虫": 2, "菌胶团": 1, "丝状菌": 1, "污泥活性": 2, "显微": 1,
+        }, "【微生物镜检】纯文字无法镜检。请在本页上传活性污泥镜检显微照片（400× 为宜，"
+           "jpg/png），AI 将自动识别钟虫/轮虫/丝状菌等指示生物，判读污泥状态（正常/老化/膨胀等）"
+           "并给出调控建议；也可点击上方「内置示例」按钮零配置秒出演示结果。"),
     ]
     ql = (q or "").lower()
     tokens = set(re.findall(r'[\u4e00-\u9fa5a-zA-Z0-9]+', ql))
@@ -568,6 +582,146 @@ def ai_assistant_stream(user_q, ctx, kb_dir=None):
 
 
 # ============================================================
+# AI 镜检（视觉多模态）—— GLM-4V 系列 / 任意 OpenAI 兼容视觉模型
+# 说明：GLM-4V 部分版本不支持 temperature/top_p，视觉调用一律不传；
+#       任何异常均降级为友好提示，绝不让页面崩溃（演示保底）。
+# ============================================================
+
+# 镜检判读专业提示词：要求三段式、限字数、不编造
+MICROSCOPE_PROMPT = (
+    "你是资深污水处理工艺工程师，正在做活性污泥微生物镜检（AI 辅助判读）。"
+    "请仔细观察用户上传的镜检显微图像，按以下三段输出，全文不超过 300 字：\n"
+    "【微生物清单】列出识别到的指示生物（如钟虫、累枝虫、轮虫、楯纤虫、豆形虫、"
+    "丝状菌、菌胶团、游离细菌等），每类注明\"大量/较多/少量/未见\"；"
+    "看不清或不确定的写\"未能确认\"，绝对不要编造。\n"
+    "【污泥状态判读】结合微生物清单与下方工况上下文，判断系统状态，"
+    "可选：活性正常 / 污泥老化 / 污泥膨胀(丝状菌) / 负荷冲击(未成熟) / 污泥中毒 / 溶解氧不足 等，"
+    "用一句话说明判读理由。\n"
+    "【调控建议】只给 2~3 条最可操作的措施（围绕排泥量、泥龄、曝气量、回流比、进水负荷等）。"
+)
+
+# 内置示例镜检图 -> 预置判读结论（比赛演示秒出、零 API 等待、永不断流）
+# 图片文件放 samples/ 目录后自动在聊天中显示，无文件时也能以文字演示。
+MICROSCOPE_DEMO = {
+    "正常污泥.jpg": (
+        "【微生物清单】钟虫：较多；累枝虫：少量；轮虫：少量；菌胶团：结构致密、边缘清晰；"
+        "丝状菌：少量、无外伸。\n"
+        "【污泥状态判读】污泥活性正常。指示生物以固着型纤毛虫（钟虫）为主，菌胶团紧实，"
+        "表明泥龄适中、溶解氧充足、系统处于稳定成熟期。\n"
+        "【调控建议】① 维持当前泥龄与 MLSS 水平，按现有排泥节奏运行；"
+        "② 好氧区 DO 稳定在 2~3 mg/L；③ 继续每日观察指示生物丰度变化，无需干预。"
+    ),
+    "丝状菌膨胀.jpg": (
+        "【微生物清单】丝状菌：大量，菌丝从菌胶团大量伸出、呈放射状；钟虫：少量；"
+        "轮虫：未见；菌胶团：松散、结构被丝状菌穿插破坏。\n"
+        "【污泥状态判读】污泥膨胀（丝状菌性膨胀）。SVI 通常偏高，二沉池易泥水分离困难、"
+        "出水跑泥风险大。\n"
+        "【调控建议】① 排查并降低进水有机负荷冲击，必要时增设初沉或调节池缓冲；"
+        "② 好氧区 DO 不宜过低，保持 ≥2 mg/L 并避免缺氧/低氧交替；"
+        "③ 可在缺氧段投加适量混凝剂（PAC/PFS）辅助沉降，同步加大排泥缩短泥龄；"
+        "④ 若进水含硫化物或低 pH，针对性控制源头。"
+    ),
+    "污泥老化.jpg": (
+        "【微生物清单】轮虫：大量；钟虫：少量、活性减弱；累枝虫：未见；"
+        "游离细菌：较多；菌胶团：细碎、松散，出现较多絮体碎片与残渣。\n"
+        "【污泥状态判读】污泥老化。泥龄过长/MLSS 过高、食微比偏低，微生物内源呼吸加剧，"
+        "絮体细碎、出水 SS 与浊度易升高。\n"
+        "【调控建议】① 加大剩余污泥排放、缩短泥龄至设计值（如 SRT 10~15 d）；"
+        "② 适当降低 MLSS，提高食微比（F/M）；③ 检查是否曝气过量，好氧区 DO 按 2~3 mg/L 控制，"
+        "避免过度曝气加剧老化。"
+    ),
+}
+
+
+def _compress_image(img_bytes, max_side=1024, quality=82):
+    """用 Pillow 把上传图片等比压缩为 JPEG bytes（控制 base64 体积与首字延迟）。
+    未安装 Pillow 或处理失败时原样返回，绝不影响主流程。"""
+    try:
+        from PIL import Image
+        import io as _io
+        im = Image.open(_io.BytesIO(img_bytes))
+        im = im.convert("RGB")
+        if max(im.size) > max_side:
+            ratio = max_side / float(max(im.size))
+            im = im.resize((max(1, int(im.width * ratio)), max(1, int(im.height * ratio))), Image.LANCZOS)
+        buf = _io.BytesIO()
+        im.save(buf, "JPEG", quality=quality)
+        return buf.getvalue()
+    except Exception:
+        return img_bytes
+
+
+def _get_vision_config():
+    """读取视觉模型配置：Key/BaseURL 复用 _get_llm_config（智谱同一把 Key），
+    模型单独读 OPENAI_VISION_MODEL，缺省/不合法时兜底为 glm-4v-flash（免费、快）。"""
+    key, base, _model = _get_llm_config()
+    vision = None
+    if st is not None:
+        try:
+            vision = st.secrets.get("OPENAI_VISION_MODEL")
+        except Exception:
+            vision = None
+    if not vision:
+        vision = os.environ.get("OPENAI_VISION_MODEL")
+    if not vision or not str(vision).startswith(("glm-4v", "gpt-4o", "gpt-4.1", "qwen-vl", "qwen2.5-vl", "qwen2-vl", "moonshot-v1")):
+        vision = "glm-4v-flash"  # 兜底：智谱免费视觉模型
+    return key, base, vision
+
+
+def microscope_stream(img_bytes, question, ctx, sample_name=None):
+    """AI 镜检（流式生成器）：识别微生物 -> 判读污泥状态 -> 调控建议。
+    sample_name 命中内置示例时直接秒回预置判读（不调 API，比赛演示保底）；
+    其余情况调用视觉大模型；任何异常都降级为友好提示，不抛错。"""
+    # ① 内置示例：预置判读，逐段秒出，绝不失败
+    if sample_name and sample_name in MICROSCOPE_DEMO:
+        import time as _t
+        for _ln in MICROSCOPE_DEMO[sample_name].split("\n"):
+            if _ln.strip():
+                yield _ln + "\n"
+                _t.sleep(0.03)
+        return
+    # ② 真实上传：视觉大模型
+    try:
+        key, base, vision_model = _get_vision_config()
+        if not key:
+            yield ("⚠️ **尚未配置大模型 Key，无法进行 AI 镜检。**\n\n"
+                   "请在 Streamlit Cloud 的 Secrets 或项目 .env 中配置：\n"
+                   "- `OPENAI_API_KEY`（智谱 API Key）\n"
+                   "- `OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4/`\n"
+                   "- `OPENAI_VISION_MODEL=glm-4v-flash`\n\n"
+                   "💡 也可以先点击上方「内置示例」按钮，零配置秒出演示结果。")
+            return
+        from openai import OpenAI
+        import base64 as _b64
+        client = OpenAI(api_key=key, base_url=base) if base else OpenAI(api_key=key)
+        jpeg_bytes = _compress_image(img_bytes)
+        b64 = _b64.b64encode(jpeg_bytes).decode()
+        q = (question or "请分析这张活性污泥镜检图，判断系统运行状态。").strip()
+        prompt = MICROSCOPE_PROMPT + "\n\n==== 当前工况上下文 ====\n" + ctx
+        resp = client.chat.completions.create(
+            model=vision_model,  # 注意：GLM-4V 不传 temperature/top_p
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": "data:image/jpeg;base64," + b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+            stream=True,
+        )
+        for ch in resp:
+            if ch.choices and ch.choices[0].delta and ch.choices[0].delta.content:
+                yield ch.choices[0].delta.content
+    except Exception as e:
+        err = str(e)[:200].replace("`", "'").replace("\n", " ")
+        yield ("\n\n> ⚠️ **AI 镜检调用失败，已降级。**\n"
+               f"> 错误：`{type(e).__name__}`：{err}\n"
+               f"> 排查：① OPENAI_VISION_MODEL 须为 `glm-4v-flash`/`glm-4v-plus` ② Key 有效且 "
+               f"base_url 为 `…/api/paas/v4/` ③ 图片压缩后体积不宜过大。\n\n")
+
+
+# ============================================================
 # LLM 配置自检（offline / local / cloud）
 # ============================================================
 def check_llm_config():
@@ -606,6 +760,11 @@ def _norm_cdf(x):
     """标准正态 CDF 近似（Abramowitz-Stegun 公式），无需 scipy。支持标量或数组输入。"""
     x = np.asarray(x, dtype=float)
     return 0.5 * (1.0 + np.sign(x) * np.sqrt(np.clip(1.0 - np.exp(-2.0 * x * x / np.pi), 0.0, 1.0)))
+
+
+# 内回流比判据的「不可达」哨兵值：当出水 TN 目标低于不可反硝化残余本底时，
+# 无论 R1 多大都无法达标（需后置反硝化/深床滤池/外加碳源），此时不再给出虚假的百分比。
+TN_R1_INFEASIBLE = 9999.0
 
 
 # ============================================================
@@ -685,10 +844,28 @@ def _ai_health_check(state):
     report["hydro"]["advice"] = hydro_advice
 
     # ---------- 维度 2：生化脱氮除磷 ----------
+    # 统一脱氮模型：tn_theory 与 min_R1 必须同源推导，否则会出现
+    # 「理论出水达标 ✅」与「内回流不足 ⚠️」自相矛盾的双判据。
+    #   TN_out(R1) = TN_in/(1+R1) × (1 − η₂) + TN_floor
+    # η₂：第二缺氧池深度反硝化效率；TN_floor：不可反硝化残余氮。
+    # min_R1 由该式直接反解，不再另用「100% 完全反硝化」的独立假设。
+    ETA_ANOX2 = 0.70      # 第二缺氧池反硝化效率（五段 Bardenpho 深度脱氮段）
+    TN_FLOOR = 3.0        # mg/L 不可反硝化残余（溶解性不可生物降解氮 + 出水氨氮本底）
     no3_res_stage1 = tn_in / (1 + R1)
-    no3_after_anox2 = no3_res_stage1 * (1 - 0.7)
-    tn_theory = no3_after_anox2 + 3
-    min_R1 = (tn_in / tn_target - 1) * 100 if tn_target > 0 else 0
+    no3_after_anox2 = no3_res_stage1 * (1 - ETA_ANOX2)
+    tn_theory = no3_after_anox2 + TN_FLOOR
+    # 反解达标所需最小内回流比：TN_in/(1+R1)×(1−η₂) + TN_floor ≤ tn_target
+    if tn_target > 0 and ETA_ANOX2 < 1.0:
+        _gap = tn_target - TN_FLOOR
+        if _gap > 1e-9:
+            min_R1 = (tn_in * (1.0 - ETA_ANOX2) / _gap - 1.0) * 100
+        else:
+            # 目标低于不可反硝化本底 → 单靠内回流无法达标
+            min_R1 = float(TN_R1_INFEASIBLE)
+    else:
+        min_R1 = 0.0
+    min_R1 = float(min(min_R1, TN_R1_INFEASIBLE))
+    tn_r1_infeasible = (min_R1 >= TN_R1_INFEASIBLE)
     cn_ratio = cod_in / tn_in if tn_in > 0 else 99.0
     cp_ratio = bod_in / tp_in if tp_in > 0 else 99.0
     tn_remove = tn_in - tn_target
@@ -735,8 +912,14 @@ def _ai_health_check(state):
     items = report["bio"]["items"]
     items.append(("✅" if tn_theory <= tn_target else "⚠️", "出水 TN 达标",
                   f"理论出水 TN={tn_theory:.2f} mg/L（目标 ≤{tn_target:.1f}）"))
-    items.append(("✅" if R1 * 100 >= min_R1 else "⚠️", "内回流 R1 充足度",
-                  f"当前 R1={R1*100:.0f}% vs 所需最小 {max(min_R1, 100):.0f}%"))
+    # R1 充足度：不可达时明确说明，避免输出「所需最小 9999%」这类无意义数字
+    if tn_r1_infeasible:
+        items.append(("⚠️", "内回流 R1 充足度",
+                      f"当前 R1={R1*100:.0f}%，但目标 TN≤{tn_target:.1f} 低于不可反硝化本底 "
+                      f"{TN_FLOOR:.1f} mg/L，单靠内回流不可达"))
+    else:
+        items.append(("✅" if R1 * 100 >= min_R1 else "⚠️", "内回流 R1 充足度",
+                      f"当前 R1={R1*100:.0f}% vs 所需最小 {max(min_R1, 100):.0f}%"))
     items.append(("✅" if cn_ratio >= 4 else "⚠️", "进水 C/N 比",
                   f"C/N={cn_ratio:.1f}（≥4 内碳充足，无需外碳）"))
     items.append(("✅" if carbon_deficit <= 0 else "⚠️", "碳源缺口",
@@ -769,7 +952,12 @@ def _ai_health_check(state):
                   f"{nh3_rate:.1f}%（要求 ≥85%）"))
     bio_advice = []
     if tn_theory > tn_target:
-        bio_advice.append(f"出水 TN 超目标：建议将内回流 R1 上调至约 {max(min_R1, 100)+20:.0f}%（当前 {R1*100:.0f}%）")
+        if tn_r1_infeasible:
+            bio_advice.append(
+                f"出水 TN 超目标且不可靠内回流解决：理论出水 {tn_theory:.2f} mg/L 已逼近不可反硝化本底 "
+                f"{TN_FLOOR:.1f} mg/L，建议增设后置反硝化深床滤池或以外加碳源强化二级缺氧池")
+        else:
+            bio_advice.append(f"出水 TN 超目标：建议将内回流 R1 上调至约 {max(min_R1, 100)+20:.0f}%（当前 {R1*100:.0f}%）")
     if carbon_deficit > 0:
         bio_advice.append(f"需补充外加碳源约 {carbon_deficit:.1f} mg/L COD（乙酸钠或甲醇，按反硝化缺口核算）")
     if cp_ratio < 17:
@@ -785,15 +973,19 @@ def _ai_health_check(state):
     report["bio"]["advice"] = bio_advice
 
     # ---------- 维度 3：二沉池 ----------
+    # 流量口径修正（《室外排水设计标准》GB 50014 校核惯例）：
+    #   表面水力负荷 q  —— 按「最大时流量」校核（峰值工况的水力分离能力）
+    #   固体表面负荷 SSL —— 按「平均日流量」校核（污泥浓缩/浓缩层高度取决于日均固体通量）
+    # 原实现 SSL 同时取 Q_max 与 (1+R)，属双重保守，会系统性高估固体负荷并误报跑泥风险。
     q_surface = q_max / s_area if s_area > 0 else 0
-    ssl = q_max * (1 + R) * mlss / 1000 / s_area * 24 if s_area > 0 else 0
+    ssl = (Q * (1 + R) * mlss / 1000 / s_area) if s_area > 0 else 0      # Q 为 m³/d 日均水量
     hrt_set = s_area * s_depth / q_max
     svi = sv30 * 10 / (mlss / 1000) if mlss > 0 else 0
     items = report["settler"]["items"]
     items.append(("✅" if q_surface < 1.5 else "⚠️", "表面水力负荷",
-                  f"{q_surface:.3f} m³/(m²·h)（最大时上限 1.5）"))
+                  f"{q_surface:.3f} m³/(m²·h)（最大时流量，上限 1.5）"))
     items.append(("✅" if ssl < 150 else "⚠️", "固体表面负荷",
-                  f"{ssl:.2f} kgMLSS/(m²·d)（上限 150）"))
+                  f"{ssl:.2f} kgMLSS/(m²·d)（平均日流量，上限 150）"))
     items.append(("✅" if 70 < svi < 150 else "⚠️", "SVI 沉降性能",
                   f"SVI={svi:.1f} mL/g（正常 70~150）"))
     items.append(("✅" if hrt_set >= 1.5 else "⚠️", "二沉池 HRT",
@@ -832,8 +1024,9 @@ def _ai_health_check(state):
     report["values"] = {
         "hrt_total": hrt_total, "ns_bod": ns_bod,
         "tn_theory": tn_theory, "srt": srt_system, "srt_nitrif": srt_nitrif,
-        "cn_ratio": cn_ratio,
+        "cn_ratio": cn_ratio, "cp_ratio": cp_ratio,
         "carbon_deficit": carbon_deficit, "min_R1": min_R1,
+        "tn_r1_infeasible": tn_r1_infeasible, "tn_floor": TN_FLOOR,
         "tp_need_chem": tp_need_chem, "cod_rate": cod_rate, "nh3_rate": nh3_rate,
         "q_surface": q_surface, "ssl": ssl, "svi": svi, "hrt_settler": hrt_set,
         "sludge_dry_daily": daily_waste_sludge,
@@ -842,131 +1035,6 @@ def _ai_health_check(state):
         "phos_daily": phos_daily, "carbon_daily": carbon_daily,
     }
     return report
-
-
-# ============================================================
-# AI 控制面板 —— 全厂 6 设备智能控制演示（纯函数，可单测）
-# ============================================================
-def _ctrl_reason(k, prev_eff, eff):
-    """AI 调参事件原因文案（纯函数）。"""
-    if k == "fan_aero":
-        return "进水氨氮负荷变化，按 DO 设定调节曝气"
-    if k == "pump_r1":
-        return f"出水 TN {prev_eff.get('tn', 0):.1f}→{eff.get('tn', 0):.1f} mg/L，调内回流提脱氮"
-    if k == "pump_c":
-        return "进水 C/N 偏低，补充碳源强化反硝化"
-    if k == "pump_p":
-        return f"出水 TP {prev_eff.get('tp', 0):.2f} mg/L 偏高，加大除磷投加"
-    if k == "fan_mem":
-        return "膜污染上升，加强膜面擦洗"
-    return "运行工况变化，自动调整"
-
-
-def _ai_control_step(state):
-    """一帧控制仿真（原地修改 state，纯函数不依赖 streamlit）。
-    state 入参：t / nh3_in / cod_in / tn_in / tp_in / mode_ai / manual(6 开度) /
-                ops(上一帧AI开度) / eff(上一帧出水) / save_kwh / save_kg / events / hist
-    写回：ops / eff(含qualify) / power / base_power / chem_ai / chem_base /
-          save_kwh / save_kg / events(追加) / hist(追加)
-    """
-    t = state.get("t", 0)
-    nh3_in = float(state.get("nh3_in", 28))
-    cod_in = float(state.get("cod_in", 350))
-    tn_in = float(state.get("tn_in", 40))
-    tp_in = float(state.get("tp_in", 5))
-    mode_ai = state.get("mode_ai", True)
-    manual = state.get("manual", {})
-    prev_eff = state.get("eff", {"nh3": 1.0, "tn": 8.0, "tp": 0.3, "cod": 40})
-
-    def _clip(v, lo, hi):
-        return max(lo, min(hi, v))
-
-    # ---------- 1. 计算 6 设备开度（AI 规则 + 滞回 / 手动） ----------
-    prev_ops = state.get("ops", {})
-    prev_eff = state.get("eff", {"nh3": 1.0, "tn": 8.0, "tp": 0.3, "cod": 40})
-    if mode_ai:
-        do_t = _clip(1.3 + 0.024 * nh3_in, 1.3, 2.5)
-        cn_ratio = cod_in / max(tn_in, 1e-6)
-        # 滞回：避免临界值抖动（升阈值高于降阈值）
-        _c_p = prev_ops.get("pump_c", 0)
-        # 碳源泵：C/N≥4 停泵（0%），C/N<4 加药档 56%（28Hz 稳态，按需低剂量投加）
-        pump_c_op = (56 if cn_ratio < 3.9 else 0) if _c_p < 56 \
-            else (56 if cn_ratio < 4.1 else 0)
-        # 除磷泵：增量式积分控制（TP 目标 ~0.13，稳态 46% ≈ 23Hz；±5 步进防抖）
-        _p_p = prev_ops.get("pump_p", 46)
-        _tp_now = prev_eff.get("tp", 0.3)
-        if _tp_now > 0.16:
-            pump_p_op = int(_clip(_p_p + 5, 20, 100))
-        elif _tp_now < 0.11:
-            pump_p_op = int(_clip(_p_p - 5, 20, 100))
-        else:
-            pump_p_op = int(_p_p)
-        op = {
-            "fan_aero": int(_clip(do_t / 2.5 * 100, 40, 100)),               # 生化风机：DO 设定驱动
-            "fan_mem": 65,                                                    # 膜池风机：膜面擦洗（简化恒定）
-            "pump_r": 70,                                                     # 外回流：MLSS 控制（简化恒定）
-            "pump_r1": int(_clip(55 + (15 - prev_eff.get("tn", 8)) * 3, 55, 100)),  # 内回流：出水 TN 反馈
-            "pump_c": pump_c_op,                                             # 碳源泵：C/N 阈值 + 滞回
-            "pump_p": pump_p_op,                                             # 除磷泵：TP 反馈 + 增量调节
-        }
-    else:
-        # 手动模式：manual 字典存频率 Hz（0~50），转开度 % (×2) 用于内部 P∝n³ 功率计算
-        op = {k: int(_clip(float(manual.get(k, 40.0)) * 2.0, 0, 100))
-              for k in ("fan_aero", "fan_mem", "pump_r", "pump_r1", "pump_c", "pump_p")}
-
-    # ---------- 2. 闭环响应（一阶模型：开度 → 去除率 → 出水 → 达标率） ----------
-    n = float(np.random.normal(0, 0.2))
-    eff = {
-        # 硝化去除率随曝气开度 97%~99%（AI 满开时贴近 0.45 mg/L）
-        "nh3": _clip(nh3_in * (1 - (0.96 + 0.03 * op["fan_aero"] / 100)) + n * 0.12, 0.15, 15),
-        # TN 去除率随内回流开度 60%~92%，碳源补充再降
-        "tn": _clip(tn_in * (1 - (0.60 + 0.32 * op["pump_r1"] / 100)) + (0.6 - 0.003 * op["pump_c"]) * 0.5 + n * 0.3, 1.0, 30),
-        # TP 去除率随除磷泵开度 96%~99%（46% 稳态时 TP≈0.13）
-        "tp": _clip(tp_in * (1 - (0.96 + 0.03 * op["pump_p"] / 100)) + n * 0.06, 0.02, 6),
-        # COD 去除率随曝气开度 90%~96%
-        "cod": _clip(cod_in * (1 - (0.90 + 0.06 * op["fan_aero"] / 100)) + n * 2, 10, 90),
-    }
-    std = {"nh3": 1.5, "tn": 15.0, "tp": 0.3, "cod": 30.0}
-    eff["qualify"] = sum(1 for k in std if eff[k] <= std[k]) / len(std) * 100
-
-    # ---------- 3. 功率 / 药量（AI vs 传统基准） ----------
-    def _power(o):
-        return (220 * (o["fan_aero"] / 100) ** 3 + 55 * (o["fan_mem"] / 100) ** 3
-                + 30 * (o["pump_r"] / 100) ** 1.5 + 45 * (o["pump_r1"] / 100) ** 1.5)
-    base_op = {"fan_aero": 100, "fan_mem": 80, "pump_r": 80, "pump_r1": 80, "pump_c": 60, "pump_p": 60}
-    p_ai = _power(op)
-    p_base = _power(base_op)
-    chem_ai = op["pump_c"] / 100 * 2.0 + op["pump_p"] / 100 * 1.5      # kg/h
-    chem_base = base_op["pump_c"] / 100 * 2.0 + base_op["pump_p"] / 100 * 1.5
-    dt_h = 0.5  # 每帧 = 0.5 h 虚拟时间（演示）
-    save_kwh = float(state.get("save_kwh", 0)) + max(0, p_base - p_ai) * dt_h
-    save_kg = float(state.get("save_kg", 0)) + max(0, chem_base - chem_ai) * dt_h
-
-    # ---------- 4. 事件日志（AI 模式：开度变化 ≥10% 记录） ----------
-    events = list(state.get("events", []))
-    if mode_ai:
-        prev_ops = state.get("ops", {})
-        names = {"fan_aero": "生化风机", "fan_mem": "膜池风机", "pump_r": "外回流泵",
-                 "pump_r1": "内回流泵", "pump_c": "碳源加药泵", "pump_p": "除磷剂加药泵"}
-        for k in op:
-            if k in prev_ops and abs(op[k] - prev_ops[k]) >= 20:
-                events.append({"t": t, "dev": names[k],
-                               "act": f"{prev_ops[k]}% → {op[k]}%",
-                               "why": _ctrl_reason(k, prev_eff, eff)})
-    if len(events) > 30:
-        events = events[-30:]
-
-    # ---------- 5. 历史趋势（最近 40 帧） ----------
-    hist = list(state.get("hist", []))
-    hist.append({"t": t, "TN": eff["tn"], "TP": eff["tp"], "NH3": eff["nh3"]})
-    if len(hist) > 40:
-        hist = hist[-40:]
-
-    state.update({"ops": op, "eff": eff, "power": p_ai, "base_power": p_base,
-                  "chem_ai": chem_ai, "chem_base": chem_base, "save_kwh": save_kwh,
-                  "save_kg": save_kg, "events": events, "hist": hist})
-    return state
-
 
 def mechanism_advice(var, bio=None):
     """根据超标变量给出机理联动处置建议（纯函数，bio 为生化计算结果 dict）。"""
@@ -1123,6 +1191,7 @@ def simulate_plant(n_steps=24*60, dt=1.0, params=None, load_profile=None,
         DO_sat=9.0,                # mg/L 饱和溶解氧
         T_water=18.0,              # ℃ 水温
         aer_rated_kw=220.0,        # kW 曝气风机额定功率
+        aer_rated_flow=3000.0,     # m³/h 曝气风机额定风量（功率标定的分母，见下方相似定律）
         pump_rated_kw=45.0,        # kW 内/外回流泵额定功率
         elec_price=0.7,            # 元/kWh
         carbon_price=2.5,          # 元/kg 碳源（乙酸钠）
@@ -1241,11 +1310,17 @@ def simulate_plant(n_steps=24*60, dt=1.0, params=None, load_profile=None,
         our = max(our_nit + our_cod + 0.3, 0.3)
         kla_req = (our + d * 0.02) / max(p["DO_sat"] - d, 0.1)
         aer_flow[i] = float(kla_req * p["V_ae"] / 16.0)   # /16 标定：典型 1500–3800 m³/h，避免功率恒饱和
-        aer_power[i] = float(p["aer_rated_kw"] * (min(aer_flow[i] / 4000.0, 1.0)) ** 3)
+        # 功率标定：以「额定风量」为分母（原硬编码 4000 使风机长期运行在 28% 额定功率，
+        # 吨水曝气电耗仅 0.075 kWh/m³，显著低于同类脱氮工艺的 0.10~0.18 区间，
+        # 会系统性低估能耗与节能空间）。改由参数 aer_rated_flow 显式控制，默认 3000 m³/h。
+        aer_power[i] = float(p["aer_rated_kw"] * (min(aer_flow[i] / float(p["aer_rated_flow"]), 1.0)) ** 3)
 
         # 回流泵功率（∝ 流量 × 回流强度）
+        # 系数已归一化：设计工况（R_internal=3.0、R_sludge=1.0、Q=Q_design）下括号内恰为 1.0，
+        # 即设计点功率 = 额定功率。原系数 0.7+0.15×3.0+0.08×1.0 = 1.23，
+        # 会导致回流泵功率超出额定值 23%，属越界。
         pump_power[i] = float(p["pump_rated_kw"] * (Q[i] / Q_d) *
-                              (0.7 + 0.15 * c["R_internal"] + 0.08 * c["R_sludge"]))
+                              (0.6 + 0.10 * c["R_internal"] + 0.10 * c["R_sludge"]))
 
         # 能耗与运行成本
         energy[i] = aer_power[i] + pump_power[i]
@@ -2104,14 +2179,20 @@ if st is not None:
             with st.form("login_form_v3", clear_on_submit=False):
                 input_pwd = st.text_input("访问密码", type="password",
                                           placeholder="🔒  请输入访问密码",
-                                          help="默认密码：123456", label_visibility="collapsed")
+                                          help="演示默认密码：123456；生产部署请在 st.secrets 或环境变量 "
+                                               "WWTP_ACCESS_PASSWORD 中设置", label_visibility="collapsed")
                 submitted = st.form_submit_button("登 录 系 统", type="primary",
                                                   use_container_width=True)
                 if submitted:
+                    # 密码来源优先级：st.secrets > 环境变量 WWTP_ACCESS_PASSWORD > 演示默认值。
+                    # 演示默认值仅用于本地演示，生产部署务必改用前两者，避免明文口令入库。
+                    correct_pwd = None
                     try:
                         correct_pwd = st.secrets["access_password"]
                     except Exception:
-                        correct_pwd = "123456"
+                        correct_pwd = None
+                    if not correct_pwd:
+                        correct_pwd = os.environ.get("WWTP_ACCESS_PASSWORD") or "123456"
                     if input_pwd == correct_pwd:
                         st.session_state.logged_in = True
                         st.success("登录成功，正在进入系统...")
@@ -2280,7 +2361,6 @@ if st is not None:
                 "📝 基础参数设置",
                 "🏭 AI 工艺体检中心",
                 "💠 浸没式超滤工况",
-                "🎛️ AI 控制面板",
                 "💰 成本经济核算",
                 "🔮 AI 预测预警",
                 "💬 AI 工艺助手",
@@ -2534,6 +2614,26 @@ if st is not None:
                 for sec, title, det in rep["overall"]:
                     st.markdown(f"- **[{_sec_name.get(sec, sec)}]** {det}")
 
+            # ---------- ④ 根因溯源（可解释 AI：症状 → 根因 → 置信度 → 处置） ----------
+            # 规则引擎给出「症状 → 可能根因(置信度) → 处置建议」链条，与三维度体检互补：
+            # 体检回答"哪项指标不达标"，根因溯源回答"为什么会不达标、先查哪里"。
+            st.markdown("---")
+            st.subheader("🔍 根因溯源（可解释 AI）")
+            _diag_bio = dict(rep.get("values", {}))
+            _diag_bio["tn_out_target"] = float(tn_target)
+            _diag_bio["cp_need_carbon"] = float(rep["values"].get("cp_ratio", 99.0)) < 17
+            _issues = diagnose_process(bp, _diag_bio)
+            if not _issues:
+                st.success("✅ 未触发任何异常规则：脱氮、除磷、硝化与泥龄均在安全区间。")
+            else:
+                for _sym, _causes in _issues:
+                    with st.expander(f"⚠️ {_sym}", expanded=True):
+                        st.markdown("**可能根因（按置信度排序）与处置建议：**")
+                        for _cause, _action, _conf in sorted(_causes, key=lambda x: -x[2]):
+                            st.markdown(
+                                f"- **{_cause}**（置信度 {_conf:.0%}）<br>"
+                                f"　　↳ 处置：{_action}", unsafe_allow_html=True)
+
 
     # ================= 页面5：浸没式超滤工况 =================
     elif page == "💠 浸没式超滤工况":
@@ -2725,100 +2825,6 @@ if st is not None:
             for piece in ai_assistant_stream(q, ctx, kb_dir=None):
                 text += piece
                 out.markdown(text)
-
-
-    # ================= 页面：AI 控制面板（演示） =================
-    elif page == "🎛️ AI 控制面板":
-        st.header("🎛️ AI 控制面板（演示）")
-        st.caption("AI 依据实时工况自动调节全厂关键设备（曝气 / 回流 / 加药），在稳定达标前提下节能降耗；"
-                   "支持「AI 自动 / 在线手动」双模式。* 演示模式：执行机构为虚拟仿真，不连接真实设备 *")
-
-        # 控制状态初始化
-        if "acp_state" not in st.session_state:
-            st.session_state.acp_state = {"t": 0, "ops": {}, "eff": {}, "manual": {},
-                                          "save_kwh": 0.0, "save_kg": 0.0,
-                                          "events": [], "hist": []}
-        if st.button("↺ 重置演示", key="acp_reset"):
-            st.session_state.acp_state = {"t": 0, "ops": {}, "eff": {}, "manual": {},
-                                          "save_kwh": 0.0, "save_kg": 0.0,
-                                          "events": [], "hist": []}
-            st.rerun()
-
-        # 控制模式（fragment 外，状态持久）
-        mode = st.radio("控制模式", ["🤖 AI 自动", "🎚️ 在线手动"], horizontal=True,
-                        key="acp_mode", index=0)
-
-        # 手动模式滑杆（fragment 外）—— 变频频率 Hz（0~50，工频 50Hz）
-        manual = {}
-        if mode == "🎚️ 在线手动":
-            st.markdown("**手动设定设备频率（Hz）**")
-            m1, m2, m3 = st.columns(3)
-            with m1:
-                manual["fan_aero"] = st.slider("生化风机", 0.0, 50.0, 40.0, step=0.5, key="acp_man_aero")
-                manual["fan_mem"] = st.slider("膜池风机", 0.0, 50.0, 40.0, step=0.5, key="acp_man_mem")
-            with m2:
-                manual["pump_r"] = st.slider("外回流泵", 0.0, 50.0, 40.0, step=0.5, key="acp_man_r")
-                manual["pump_r1"] = st.slider("内回流泵", 0.0, 50.0, 40.0, step=0.5, key="acp_man_r1")
-            with m3:
-                manual["pump_c"] = st.slider("碳源加药泵", 0.0, 50.0, 35.0, step=0.5, key="acp_man_c")
-                manual["pump_p"] = st.slider("除磷剂加药泵", 0.0, 50.0, 35.0, step=0.5, key="acp_man_p")
-            st.session_state.acp_state["manual"] = manual
-
-        # ---------- 实时控制区（fragment 每 2s 自动推进一帧） ----------
-        @st.fragment(run_every=2)
-        def _acp_live():
-            if page != "🎛️ AI 控制面板":
-                return
-            st_ = st.session_state.acp_state
-            st_["t"] = st_.get("t", 0) + 1
-            t = st_["t"]
-            # 模拟进水负荷（正弦日周期 + 噪声）
-            st_["nh3_in"] = float(np.clip(28 + 8 * np.sin(t / 6) + np.random.normal(0, 1.5), 15, 45))
-            st_["cod_in"] = float(np.clip(350 + 70 * np.sin(t / 9 + 1) + np.random.normal(0, 15), 220, 520))
-            st_["tn_in"] = st_["nh3_in"] * 1.4
-            st_["tp_in"] = 5.0
-            st_["mode_ai"] = (mode == "🤖 AI 自动")
-            _ai_control_step(st_)
-
-            ops = st_.get("ops", {})
-            eff = st_.get("eff", {})
-
-            st.markdown("---")
-            # ① 设备控制状态
-            st.subheader("① 设备控制状态")
-            dev_cfg = [
-                ("fan_aero", "生化风机", "曝气 DO 控制"), ("fan_mem", "膜池风机", "膜面擦洗"),
-                ("pump_r", "外回流泵", "污泥回流"), ("pump_r1", "内回流泵", "脱氮回流"),
-                ("pump_c", "碳源加药泵", "反硝化碳源"), ("pump_p", "除磷剂加药泵", "化学除磷"),
-            ]
-            for i in range(0, 6, 3):
-                row = st.columns(3)
-                for j, (k, name, desc) in enumerate(dev_cfg[i:i + 3]):
-                    with row[j]:
-                        op = ops.get(k, 0)
-                        st.metric(name, f"{op * 0.5:.1f} Hz",
-                                  help=f"{desc}；变频 0~50Hz（工频），开度 = {op}%；AI 模式自动计算，手动模式可拖滑杆")
-
-            # ② 出水水质（闭环响应）
-            st.markdown("---")
-            st.subheader("② 出水水质（闭环响应）")
-            q1, q2, q3, q4 = st.columns(4)
-            q1.metric("出水 NH₃-N", f"{eff.get('nh3', 0):.2f}", help="限值 1.5 mg/L")
-            q2.metric("出水 TN", f"{eff.get('tn', 0):.2f}", help="限值 15 mg/L")
-            q3.metric("出水 TP", f"{eff.get('tp', 0):.2f}", help="限值 0.3 mg/L")
-            q4.metric("出水 COD", f"{eff.get('cod', 0):.0f}", help="限值 30 mg/L")
-
-            # ③ 事件日志
-            st.markdown("---")
-            st.subheader("③ AI 调参事件日志")
-            evs = st_.get("events", [])[-8:]
-            if evs:
-                for e in reversed(evs):
-                    st.markdown(f"- **帧 {e['t']}** · {e['dev']}：{e['act']} —— {e['why']}")
-            else:
-                st.caption("（AI 自动模式下，设备开度变化 ≥10% 时自动记录事件；可切「在线手动」拖滑杆对比）")
-
-        _acp_live()
 
 
     # ================= 页面6：成本经济核算 =================
@@ -3985,13 +3991,15 @@ if st is not None:
     # ================= 页面12：AI 工艺助手 =================
     elif page == "💬 AI 工艺助手":
         st.header("💬 AI 工艺助手（自然语言交互）")
-        st.caption("注入当前系统计算结果与知识库作为上下文；侧边栏显示「云端/本地模型已配置」时由大模型实时生成回答，"
+        st.caption("支持文字提问与🔎AI镜检：上传活性污泥镜检照片即自动识别微生物、判读污泥状态并给调控建议；"
+                   "注入当前系统计算结果与知识库作为上下文；侧边栏显示「云端/本地模型已配置」时由大模型实时生成回答，"
                    "否则自动降级为内置规则引擎。当前模式见左侧「AI 模式」状态条。")
 
         # 能力标签 Chips（专业 AI 界面元素）
         st.markdown("""
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 14px">
             <span style="padding:3px 12px;border-radius:999px;background:rgba(83,74,183,0.12);color:#8b84e6;font-size:12px;border:0.5px solid rgba(83,74,183,0.3)">🔬 工艺诊断</span>
+            <span style="padding:3px 12px;border-radius:999px;background:rgba(29,158,117,0.12);color:#2ebd91;font-size:12px;border:0.5px solid rgba(29,158,117,0.3)">🔎 AI 镜检</span>
             <span style="padding:3px 12px;border-radius:999px;background:rgba(29,158,117,0.12);color:#2ebd91;font-size:12px;border:0.5px solid rgba(29,158,117,0.3)">📊 数据分析</span>
             <span style="padding:3px 12px;border-radius:999px;background:rgba(55,138,221,0.12);color:#5da3e6;font-size:12px;border:0.5px solid rgba(55,138,221,0.3)">💡 方案推荐</span>
             <span style="padding:3px 12px;border-radius:999px;background:rgba(226,75,74,0.12);color:#e67373;font-size:12px;border:0.5px solid rgba(226,75,74,0.3)">🔧 故障排查</span>
@@ -4010,6 +4018,10 @@ if st is not None:
             ctx_parts.append("【生化结果】理论出水TN {:.2f} mg/L，碳源缺口 {:.1f} mg/L，化学除磷需求 {:.2f} mg/L，SRT {:.1f} d，C/N {:.1f}".format(
                 bio.get('tn_theory', 0), bio.get('carbon_deficit', 0), bio.get('tp_need_chem', 0),
                 bio.get('srt', 0), bio.get('cn_ratio', 0)))
+        # 联动：把最近一次镜检结论注入上下文，后续追问可直接引用（同一对话闭环）
+        _last_micro = st.session_state.get("last_micro_result", "")
+        if _last_micro:
+            ctx_parts.append("【最近镜检结论】" + _last_micro[:400])
         ctx = "\n".join(ctx_parts) if ctx_parts else "（尚无可用的计算结果，请先在相关页面完成计算）"
 
         # ===== 页面吉祥物：小鹏（提前渲染，避免流式输出期间消失）=====
@@ -4021,6 +4033,7 @@ if st is not None:
                 "💡 试试问我：「当前总氮偏高怎么处理？」",
                 "🔧 我可以帮你做工艺诊断、预测预警和运行优化哦～",
                 "🌊 五段 Bardenpho 工艺相关问题，我都很熟悉！",
+                "🔬 上传一张活性污泥镜检图，我能帮你识别微生物、判断污泥状态！",
                 "📉 出水 COD 异常？<br>我可以帮你分析原因和调控措施。",
                 "⚡ 想优化运行成本？问问我关于电耗和药耗的建议。",
                 "🔮 我可以基于历史数据预测未来出水水质趋势。"
@@ -4103,29 +4116,112 @@ if st is not None:
 
         if "ai_messages" not in st.session_state:
             st.session_state.ai_messages = []
+        if "last_micro_result" not in st.session_state:
+            st.session_state.last_micro_result = ""
+
+        # ===== 镜检图入口：真实上传 或 内置示例（演示秒出）=====
+        st.markdown("📎 **AI 镜检（可选）**：上传活性污泥镜检照片，识别微生物 → 判读污泥状态 → 给出调控建议")
+        _col_up, _col_demo = st.columns([3, 1])
+        with _col_up:
+            pic_up = st.file_uploader("上传镜检图（jpg/jpeg/png），上传后点下方「开始镜检」",
+                                      type=["jpg", "jpeg", "png"], key="chat_pic")
+        with _col_demo:
+            st.caption("内置示例（预置判读·秒出）")
+            _b_norm = st.button("🟢 正常污泥", key="demo_norm", use_container_width=True)
+            _b_bulk = st.button("🟡 丝状菌膨胀", key="demo_bulk", use_container_width=True)
+            _b_old = st.button("🔴 污泥老化", key="demo_old", use_container_width=True)
+        # 待镜检内容：示例按钮 > 开始按钮（需图片）> 无
+        _micro_run = None   # ("demo", sample_name) / ("upload", bytes) / None
+        if _b_norm:
+            _micro_run = ("demo", "正常污泥.jpg")
+        elif _b_bulk:
+            _micro_run = ("demo", "丝状菌膨胀.jpg")
+        elif _b_old:
+            _micro_run = ("demo", "污泥老化.jpg")
+        _micro_img_bytes = None
+        if pic_up is not None:
+            _micro_img_bytes = pic_up.getvalue()  # 展示预览
+        if _micro_run is None:
+            if st.button("🔬 开始镜检分析", key="micro_start", type="primary",
+                         disabled=pic_up is None):
+                _micro_run = ("upload", pic_up.getvalue())
+        if _micro_run is not None and _micro_run[0] == "demo":
+            _demo_path = os.path.join(SCRIPT_DIR, "samples", _micro_run[1])
+            if os.path.exists(_demo_path):
+                with open(_demo_path, "rb") as _f:
+                    _micro_img_bytes = _f.read()  # 有真实示例图则展示
+        if _micro_img_bytes is not None and _micro_run is None:
+            # 只预览不触发（避免跨 rerun 重复镜检）
+            try:
+                st.image(_micro_img_bytes, width=240, caption="已选择镜检图（点上方「开始镜检分析」执行）")
+            except Exception:
+                pass
+
+        # 聊天记录回放（支持图片消息）
         for m in st.session_state.ai_messages:
             with st.chat_message(m["role"], avatar="🧑‍💼" if m["role"] == "user" else "🤖"):
+                if m.get("img_b64"):
+                    try:
+                        st.image(base64.b64decode(m["img_b64"]), width=260)
+                    except Exception:
+                        pass
                 st.markdown(m["content"])
-        if q := st.chat_input("向工艺助手提问，如：当前总氮偏高怎么处理？"):
-            st.session_state.ai_messages.append({"role": "user", "content": q})
+
+        # ——————————— 发送分支（统一构造，保证不重复追加）———————————
+        _new_user_msg = None
+        is_micro = False
+        # 1) 镜检触发优先级最高：示例按钮 / 开始镜检按钮
+        if _micro_run is not None:
+            is_micro = True
+            if _micro_run[0] == "demo":
+                _new_user_msg = "请分析这张活性污泥镜检图（内置示例：%s），判断污泥状态。" % _micro_run[1]
+            else:
+                _new_user_msg = "请分析这张活性污泥镜检图，判断污泥状态。"
+        # 2) 否则走文字助手（chat_input 始终创建，位置稳定）
+        q = st.chat_input("向工艺助手提问，如：当前总氮偏高怎么处理？")
+        if _new_user_msg is None and q:
+            _new_user_msg = q
+        if _new_user_msg is not None:
+            # demo 示例若有真实图片文件，一并显示在消息里；否则仅文字
+            _micro_img = _micro_img_bytes if (is_micro and _micro_run) else None
+            _micro_sample = _micro_run[1] if (is_micro and _micro_run and _micro_run[0] == "demo") else None
+            _user_entry = {"role": "user", "content": _new_user_msg}
+            if _micro_img is not None:
+                _user_entry["img_b64"] = base64.b64encode(_micro_img).decode()
+            st.session_state.ai_messages.append(_user_entry)
             with st.chat_message("user", avatar="🧑‍💼"):
-                st.markdown(q)
+                if _user_entry.get("img_b64"):
+                    try:
+                        st.image(base64.b64decode(_user_entry["img_b64"]), width=260)
+                    except Exception:
+                        pass
+                st.markdown(_new_user_msg)
             with st.chat_message("assistant", avatar="🤖"):
                 # AI 处理步骤展示（快速渐进点亮，让评委看到 AI 工作过程）
                 import time as _time
-                _steps = ["📊 读取基础参数与生化结果", "📖 检索工艺知识库", "💡 推导运行建议", "✍️ 生成回复"]
+                if is_micro:
+                    _steps = ["🔬 读取镜检图像", "🦠 识别微生物种群", "⚖️ 结合工况判读", "💡 生成调控建议"]
+                else:
+                    _steps = ["📊 读取基础参数与生化结果", "📖 检索工艺知识库", "💡 推导运行建议", "✍️ 生成回复"]
                 _ph = st.empty()
                 for _i in range(len(_steps)):
                     _done = "，".join(f"✅ {s}" for s in _steps[:_i + 1])
                     _todo = "，".join(f"⏳ {s}" for s in _steps[_i + 1:])
-                    _html = f"🤖 **AI 处理中**<br/>{_done}"
+                    _html = f"{'🔬' if is_micro else '🤖'} **{'AI 镜检分析中' if is_micro else 'AI 处理中'}**<br/>{_done}"
                     if _todo:
                         _html += f"<br/>{_todo}"
                     _ph.markdown(_html, unsafe_allow_html=True)
                     _time.sleep(0.28)
                 _ph.empty()
-                reply = st.write_stream(ai_assistant_stream(q, ctx, kb_dir=find_kb_dir()))
+                if is_micro:
+                    reply = st.write_stream(microscope_stream(
+                        _micro_img or b"", _new_user_msg, ctx,
+                        sample_name=_micro_sample))
+                    st.session_state.last_micro_result = reply
+                else:
+                    reply = st.write_stream(ai_assistant_stream(_new_user_msg, ctx, kb_dir=find_kb_dir()))
             st.session_state.ai_messages.append({"role": "assistant", "content": reply})
         if st.button("清空对话", key="ai_clear"):
             st.session_state.ai_messages = []
+            st.session_state.last_micro_result = ""
 
